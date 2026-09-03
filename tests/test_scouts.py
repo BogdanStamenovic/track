@@ -125,6 +125,21 @@ def test_envelope_error_becomes_a_scout_error() -> None:
         scout_listings("a laptop", "eBay", runner=runner)
 
 
+def test_an_errored_scout_is_rejected_even_when_its_output_would_parse() -> None:
+    """is_error must be honoured on its own, not incidentally.
+
+    The test above passes even with the is_error check deleted, because
+    "Not logged in" contains no JSON array and so fails at the parse instead
+    -- right outcome, wrong reason. A scout that errors partway (budget
+    exhausted mid-answer) can still emit a well-formed array, and that is the
+    case where ignoring the flag silently accepts a truncated result.
+    """
+    _seen, runner = _capturing(envelope(LISTINGS, is_error=True, cost=0.5))
+
+    with pytest.raises(ScoutError, match="scout failed"):
+        scout_listings("a laptop", "eBay", runner=runner)
+
+
 def test_bare_stdout_still_parses_if_the_envelope_ever_disappears() -> None:
     _seen, runner = _capturing(LISTINGS)
     result = scout_listings("a laptop", "eBay", runner=runner)

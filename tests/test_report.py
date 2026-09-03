@@ -105,6 +105,30 @@ def test_listings_over_the_ceiling_are_counted_out_not_shown() -> None:
     assert "1 over the" in summary
 
 
+def test_a_find_priced_exactly_at_the_ceiling_is_within_budget() -> None:
+    """--max-price 60 means at most 60, so 60.00 is a hit, not an overshoot.
+
+    The existing cases sat at 900 and 300 against a 500 ceiling and so never
+    touched the boundary: > and >= are indistinguishable until something
+    lands exactly on it.
+    """
+    summary = build_summary(
+        _assignment(max_price=500.0), [_finding("exactly at budget", 500.0, 0.7)], 3
+    )
+
+    assert "exactly at budget" in summary
+    assert "over the" not in summary
+
+
+def test_a_find_one_cent_over_the_ceiling_is_out() -> None:
+    summary = build_summary(
+        _assignment(max_price=500.0), [_finding("just over", 500.01, 0.7)], 3
+    )
+
+    assert "just over" not in summary
+    assert "1 over the" in summary
+
+
 def test_no_ceiling_means_nothing_is_filtered() -> None:
     summary = build_summary(_assignment(), [_finding("pricey", 9999.0, 0.1)], 3)
     assert "pricey" in summary

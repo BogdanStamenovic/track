@@ -174,6 +174,13 @@ is zero, so they pinned nothing. Those now assert the property that matters
 (a resumed machine needs *some* seconds to come up; a scout's budget ceiling
 must stay *small*) with the constant checked alongside it.
 
+`scripts/mutate-logic.sh` does the same for comparison operators and branch
+conditions, which is where the sharper holes were: a `--max-price` ceiling
+tested at 900 and 300 against a limit of 500 but never *at* 500, so `>` and
+`>=` were indistinguishable and a find priced exactly at budget could have been
+dropped; and an `is_error` check whose test passed only because the error text
+contained no JSON array, staying green with the check removed entirely.
+
 Clear `__pycache__` before trusting a re-run after editing a single constant —
 same file size and same mtime second means Python will reuse the stale
 bytecode and report a result for code you are no longer running. That happened
