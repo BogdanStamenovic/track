@@ -217,8 +217,13 @@ here, on source verified byte-identical to git.
 - **Scores are relative, not absolute.** `1.00` means "cheapest this
   assignment has ever seen", which on a young assignment with three data
   points means very little. It is a ranking signal, not a valuation.
-- **A run costs real money.** Roughly $0.10–$0.45 per run in testing, five
-  scouts wide. `track show` reports the running total per assignment.
+- **A run consumes whatever `claude` is authenticated with.** On an API key
+  that is billable credit; on a Claude subscription it draws down the plan's
+  usage allowance and bills nothing. Either way the figure track records is
+  the list-price estimate the CLI reports, not necessarily a charge — roughly
+  $0.10–$0.45 per run in testing, five scouts wide, and `track show` reports
+  the running total per assignment. Treat it as a measure of how much work a
+  run did.
 - **The `wake` integration is one file.** `scheduler.py` is the only place
   that knows wake's CLI shape; if that contract changes, nothing else does.
 - **Self-re-arming needs `wake` 7041d08 or newer.** Because `track run`

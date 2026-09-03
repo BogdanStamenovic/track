@@ -58,10 +58,16 @@ SCOUT_STRICT_MCP = True
 # environment surprises in an unattended job.
 SCOUT_SETTING_SOURCES = ""
 
-# Hard financial backstop. This is not an interactive session anybody is
-# watching, it is a job on a timer, so it needs a real ceiling: a scout that
-# starts refining queries in search of an exact price match (observed live)
-# will happily burn its whole timeout chasing one listing.
+# The runaway ceiling. This is not an interactive session anybody is watching,
+# it is a job on a timer that re-arms itself, so it needs a hard stop: a scout
+# that starts refining queries in search of an exact price match (observed
+# live) will happily burn its whole timeout chasing one listing.
+#
+# What it protects depends on how `claude` is authenticated. Against an API
+# key it caps billable spend; against a subscription it caps how much of the
+# plan's usage allowance one scout can eat before the rest of the run, and the
+# other assignments on the same timer, go hungry. The units are dollars
+# because that is the flag the CLI offers, not because a bill is implied.
 SCOUT_MAX_BUDGET_USD = "0.50"
 
 # CONSTRAINT, do not "clean this up": every scout inherits the operator's
