@@ -45,6 +45,7 @@ track remove <assignment-id>
 | --- | --- |
 | `--interval` | how often to re-check: `6h`, `30m`, `2d`, or bare seconds |
 | `--max-price` | ceiling; dearer finds are still recorded, just kept out of the summary |
+| `--market` | where you are buying from, e.g. `Serbia` — a hard constraint on which sources count, not a preference (default `$TRACK_MARKET`) |
 | `--notify` | hotline agent whose Discord channel gets the summary — **needed for scheduled runs** (see below) |
 | `--wake-backend` | `shell` for a machine that stays up; `rtcwake`/`wol` to resume a sleeping one first |
 | `--wake-target` | MAC address, for `--wake-backend wol` |
@@ -96,6 +97,21 @@ b15f0a7b: a 16GB DDR4-3200 desktop RAM kit, used or open-box
 **Scouts.** Every run fans out one `claude -p --model sonnet` session per
 source. They get `WebSearch` and `WebFetch` and nothing else — see *Scouts are
 deliberately caged* below — and hand back strict JSON.
+
+**Market.** Without `--market`, scouts return whatever the open web surfaces,
+which in practice means US sources — eBay, Newegg, and a chain of walk-in
+stores on another continent. Set it and it becomes a hard constraint in the
+scout prompt: local marketplaces and classifieds, sellers who actually ship
+there, local-language sites over international ones. Export `TRACK_MARKET`
+once rather than passing it every time. `track add` warns when neither is set.
+
+**Scoring is per currency.** A finding is only ever compared against others
+quoted in the same currency. Pooling them as bare numbers would rank every
+dinar-priced listing above every euro one; in a live Serbian run, a 120 EUR
+listing scores 0.83 against the EUR history rather than 1.00 for being
+numerically smaller than every RSD price on record. Source statistics are
+keyed by source *and* currency for the same reason — a median taken across two
+currencies describes nothing.
 
 **Scoring.** A finding's score is the share of the assignment's known prices it
 undercuts: `1.00` is cheaper than everything on record, `0.50` means there was
@@ -227,9 +243,9 @@ here, on source verified byte-identical to git.
 ## Not built yet
 
 - No per-source scheduling — every source is scouted on the same interval.
-- No currency normalisation. Prices are compared as numbers, so an assignment
-  whose sources quote in different currencies will score them against each
-  other as if they were the same unit.
+- No currency *conversion*. Prices are never pooled across currencies, which
+  is the correctness-critical half, but track also cannot tell you whether
+  6,900 RSD beats 60 EUR. It reports both and leaves the arithmetic to you.
 - No condition or specification matching beyond what the assignment text tells
   a scout. It will happily report a 32GB kit for a 16GB assignment if a scout
   thought it was relevant.

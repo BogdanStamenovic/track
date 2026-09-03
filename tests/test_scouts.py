@@ -250,3 +250,42 @@ def test_no_sources_means_no_subprocess_at_all() -> None:
         raise AssertionError("should not have run a scout")
 
     assert run_scouts("a laptop", [], runner=runner).findings == []
+
+
+# -- the market constraint ------------------------------------------------
+
+
+def test_the_market_reaches_both_scout_prompts_as_a_hard_constraint() -> None:
+    """Without it, scouts return whatever the open web surfaces: US sources."""
+    seen, runner = _capturing(envelope("[]"))
+    discover_sources("a laptop", market="Serbia", runner=runner)
+    discovery = seen["prompt"]
+
+    seen, runner = _capturing(envelope("[]"))
+    scout_listings("a laptop", "KupujemProdajem", market="Serbia", runner=runner)
+    listing = seen["prompt"]
+
+    for prompt in (discovery, listing):
+        assert "MARKET: Serbia" in prompt
+        assert "hard constraint" in prompt
+        assert "do not convert" in prompt, "prices must stay in the listing's currency"
+
+
+def test_no_market_leaves_the_prompt_unconstrained() -> None:
+    seen, runner = _capturing(envelope("[]"))
+    discover_sources("a laptop", runner=runner)
+
+    assert "MARKET:" not in seen["prompt"]
+
+
+def test_the_market_reaches_a_fanned_out_scout() -> None:
+    seen: list[str] = []
+
+    def runner(cmd, *, input, timeout):
+        seen.append(input or "")
+        return completed(envelope("[]"))
+
+    run_scouts("a laptop", ["KupujemProdajem", "Limundo"], market="Serbia", runner=runner)
+
+    assert len(seen) == 2
+    assert all("MARKET: Serbia" in p for p in seen)

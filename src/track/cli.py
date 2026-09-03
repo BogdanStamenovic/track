@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections.abc import Callable, Sequence
@@ -65,6 +66,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--interval", default="6h", help="how often to re-check (e.g. 6h, 30m); default 6h"
     )
     add_p.add_argument("--max-price", type=float, default=None, help="price ceiling for reports")
+    add_p.add_argument(
+        "--market",
+        default=os.environ.get("TRACK_MARKET"),
+        help="where you are buying from, e.g. 'Serbia' -- a hard constraint on which "
+        "sources count, not a preference (default: $TRACK_MARKET)",
+    )
     add_p.add_argument(
         "--notify",
         help="hotline agent whose Discord channel gets the summary "
@@ -200,12 +207,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.text,
                     interval_seconds,
                     args.max_price,
+                    market=args.market,
                     notify_agent=args.notify,
                     wake_backend=args.wake_backend,
                     wake_target=args.wake_target,
                     wake_on=args.wake_on,
                 )
-                log(f"tracking {assignment.id}: {assignment.text!r} every {args.interval}")
+                where = f" in {assignment.market}" if assignment.market else ""
+                log(f"tracking {assignment.id}: {assignment.text!r}{where} every {args.interval}")
+                if not assignment.market:
+                    log(
+                        "track: warning: no --market set, so scouts will return whatever "
+                        "the open web surfaces -- usually US sources (set --market or "
+                        "TRACK_MARKET)"
+                    )
                 if not args.no_schedule:
                     _arm(store, assignment, vlog if args.verbose else log)
                 print(assignment.id)
@@ -273,8 +288,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     return 0
                 print(f"{assignment.id}: {assignment.text}")
                 for stat in stats:
+                    label = f"{stat.name} ({stat.currency})" if stat.currency else stat.name
                     print(
-                        f"  {stat.name}: {stat.listings} listings, {stat.priced} priced "
+                        f"  {label}: {stat.listings} listings, {stat.priced} priced "
                         f"({stat.price_rate:.0%}), from {_money(stat.cheapest, stat.currency)}, "
                         f"median {_money(stat.median, stat.currency)}"
                     )

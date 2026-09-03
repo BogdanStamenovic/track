@@ -208,7 +208,7 @@ def test_sources_reports_statistics(capsys, db: Path) -> None:
     main(["--db", str(db), "sources", assignment_id])
     out = capsys.readouterr().out
 
-    assert "eBay: 3 listings, 2 priced (67%)" in out
+    assert "eBay (USD): 3 listings, 2 priced (67%)" in out
     assert "from 100.00 USD" in out
     assert "median 200.00 USD" in out
 
@@ -343,3 +343,30 @@ def _raiser(exc: Exception):
         raise exc
 
     return boom
+
+
+def test_market_is_stored_and_defaults_from_the_environment(db: Path, monkeypatch) -> None:
+    monkeypatch.setenv("TRACK_MARKET", "Serbia")
+    assignment_id = _add(db, "--notify", "x")
+    with Store(db) as store:
+        a = store.get_assignment(assignment_id)
+
+    assert a is not None and a.market == "Serbia"
+
+
+def test_an_explicit_market_beats_the_environment(db: Path, monkeypatch) -> None:
+    monkeypatch.setenv("TRACK_MARKET", "Serbia")
+    assignment_id = _add(db, "--market", "Croatia", "--notify", "x")
+    with Store(db) as store:
+        a = store.get_assignment(assignment_id)
+
+    assert a is not None and a.market == "Croatia"
+
+
+def test_adding_without_a_market_warns_that_results_will_be_foreign(
+    capsys, db: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("TRACK_MARKET", raising=False)
+    main(["--db", str(db), "add", "a laptop", "--notify", "x"])
+
+    assert "no --market set" in capsys.readouterr().err

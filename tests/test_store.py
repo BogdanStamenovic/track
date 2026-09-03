@@ -104,7 +104,18 @@ def test_price_history_is_not_dominated_by_one_re_seen_listing(store: Store, ass
         _add(store, assignment.id, r1, "stale", 900.0)
     _add(store, assignment.id, r1, "bargain", 100.0)
 
-    assert sorted(store.price_history(assignment.id)) == [100.0, 900.0]
+    assert sorted(store.price_history(assignment.id)["USD"]) == [100.0, 900.0]
+
+
+def test_price_history_never_pools_two_currencies(store: Store, assignment) -> None:
+    """3000 RSD against 30 EUR as bare floats makes every dinar look like a steal."""
+    r1 = store.start_run(assignment.id)
+    store.add_finding(assignment.id, r1, "KP", "t", 3000.0, "RSD", None, "k1", None, True)
+    store.add_finding(assignment.id, r1, "eBay", "t", 30.0, "EUR", None, "k2", None, True)
+
+    history = store.price_history(assignment.id)
+
+    assert history == {"RSD": [3000.0], "EUR": [30.0]}
 
 
 def test_history_ignores_findings_with_no_price(store: Store, assignment) -> None:
@@ -112,7 +123,7 @@ def test_history_ignores_findings_with_no_price(store: Store, assignment) -> Non
     _add(store, assignment.id, r1, "priced", 100.0)
     _add(store, assignment.id, r1, "blocked", None, None)
 
-    assert store.price_history(assignment.id) == [100.0]
+    assert store.price_history(assignment.id) == {"USD": [100.0]}
 
 
 def test_has_seen_is_what_makes_a_finding_new(store: Store, assignment) -> None:

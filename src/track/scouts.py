@@ -114,8 +114,18 @@ def _default_runner(
     )
 
 
-SOURCE_DISCOVERY_TEMPLATE = """You are a market research scout. Assignment: {assignment}
+MARKET_CLAUSE = """
+MARKET: {market}. This is a hard constraint, not a preference. Only sources
+that actually serve a buyer located there count -- local marketplaces and
+classifieds, local retailers, and sellers who genuinely ship there at a sane
+cost. A large foreign marketplace the buyer cannot practically order from is
+not a source, however cheap its listings look. Prefer the local-language
+sites real buyers there use over the international ones. Quote prices in the
+currency the listing is actually in; do not convert.
+"""
 
+SOURCE_DISCOVERY_TEMPLATE = """You are a market research scout. Assignment: {assignment}
+{market_clause}
 Work out who realistically sells this kind of thing cheap, and where:
 marketplaces, liquidators, refurbishers, classifieds, forums, local
 second-hand chains -- whatever actually applies to this category. Favour
@@ -133,7 +143,7 @@ ONLY a JSON array, no prose, no markdown fences:
 At most 8 sources, best first."""
 
 LISTING_SCOUT_TEMPLATE = """You are a bargain-hunting scout. Assignment: {assignment}
-
+{market_clause}
 Search {source_hint} right now for current listings that match.
 Do not buy anything and do not contact anyone.
 
@@ -225,16 +235,23 @@ def _parse_json_array(raw: str) -> list[dict[str, Any]]:
     return [item for item in data if isinstance(item, dict)]
 
 
+def _market_clause(market: str | None) -> str:
+    return MARKET_CLAUSE.format(market=market) if market else ""
+
+
 def discover_sources(
     assignment_text: str,
     *,
+    market: str | None = None,
     model: str = DEFAULT_MODEL,
     timeout: int = DEFAULT_TIMEOUT,
     runner: Runner = _default_runner,
     max_budget_usd: str = SCOUT_MAX_BUDGET_USD,
 ) -> tuple[list[dict[str, Any]], float]:
     prompt = SOURCE_DISCOVERY_TEMPLATE.format(
-        assignment=assignment_text, block_policy=BLOCK_POLICY
+        assignment=assignment_text,
+        block_policy=BLOCK_POLICY,
+        market_clause=_market_clause(market),
     )
     raw, cost = _run_claude(
         prompt, model=model, timeout=timeout, runner=runner, max_budget_usd=max_budget_usd
@@ -246,13 +263,17 @@ def scout_listings(
     assignment_text: str,
     source_hint: str,
     *,
+    market: str | None = None,
     model: str = DEFAULT_MODEL,
     timeout: int = DEFAULT_TIMEOUT,
     runner: Runner = _default_runner,
     max_budget_usd: str = SCOUT_MAX_BUDGET_USD,
 ) -> ScoutResult:
     prompt = LISTING_SCOUT_TEMPLATE.format(
-        assignment=assignment_text, source_hint=source_hint, block_policy=BLOCK_POLICY
+        assignment=assignment_text,
+        source_hint=source_hint,
+        block_policy=BLOCK_POLICY,
+        market_clause=_market_clause(market),
     )
     raw, cost = _run_claude(
         prompt, model=model, timeout=timeout, runner=runner, max_budget_usd=max_budget_usd
@@ -291,6 +312,7 @@ def run_scouts(
     assignment_text: str,
     source_hints: list[str],
     *,
+    market: str | None = None,
     model: str = DEFAULT_MODEL,
     timeout: int = DEFAULT_TIMEOUT,
     runner: Runner = _default_runner,
@@ -314,6 +336,7 @@ def run_scouts(
                 scout_listings,
                 assignment_text,
                 hint,
+                market=market,
                 model=model,
                 timeout=timeout,
                 runner=runner,

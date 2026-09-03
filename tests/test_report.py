@@ -259,3 +259,27 @@ def test_a_failed_reschedule_is_the_loudest_thing_in_the_summary() -> None:
 
 def test_a_healthy_run_says_nothing_about_scheduling() -> None:
     assert "warning" not in build_summary(_assignment(), [_finding()], 3)
+
+
+def test_a_source_with_prices_is_not_also_listed_as_unreadable() -> None:
+    """Stats are per (source, currency); one site can produce priced and unpriced groups."""
+    stats = [
+        SourceStat("KupujemProdajem", 6, 6, 60.0, 144.0, 0.9, "EUR"),
+        SourceStat("KupujemProdajem", 5, 5, 7000.0, 8999.0, 0.8, "RSD"),
+        SourceStat("KupujemProdajem", 2, 0, None, None, None, None),
+        SourceStat("WalledGarden", 3, 0, None, None, None, None),
+    ]
+    summary = build_summary(_assignment(), [_finding()], 3, stats=stats)
+
+    assert "no price readable from: WalledGarden" in summary
+    assert "no price readable from: KupujemProdajem" not in summary
+
+
+def test_multiple_currencies_are_labelled_as_per_currency() -> None:
+    stats = [
+        SourceStat("KP", 6, 6, 60.0, 144.0, 0.9, "EUR"),
+        SourceStat("KP", 5, 5, 7000.0, 8999.0, 0.8, "RSD"),
+    ]
+    summary = build_summary(_assignment(), [_finding()], 3, stats=stats)
+
+    assert "(per currency)" in summary, "must not imply 7000 RSD is dearer than 60 EUR"

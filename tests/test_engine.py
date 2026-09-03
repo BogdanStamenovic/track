@@ -413,3 +413,50 @@ def test_only_the_source_limit_worth_of_scouts_is_launched(store: Store, monkeyp
     run_assignment(store, a)
 
     assert len(seen["hints"]) == DEFAULT_SOURCE_LIMIT
+
+
+def test_a_finding_is_scored_only_against_its_own_currency(store: Store, monkeypatch) -> None:
+    """Pooled as bare floats, every dinar-priced listing outranks every euro one."""
+    a = store.add_assignment("a filter module", 3600, market="Serbia")
+    store.upsert_source(a.id, "KupujemProdajem")
+    _fake_scouts(monkeypatch, [
+        ScoutFinding("KP", "dinar cheap", 3000.0, "RSD", "https://kp/1"),
+        ScoutFinding("KP", "dinar dear", 9000.0, "RSD", "https://kp/2"),
+    ])
+    run_assignment(store, a)
+
+    _fake_scouts(monkeypatch, [
+        ScoutFinding("KP", "euro listing", 40.0, "EUR", "https://kp/3"),
+    ])
+    found, _summary = run_assignment(store, store.get_assignment(a.id) or a)
+
+    # 40 is a smaller number than every RSD price on record; if the currencies
+    # were pooled it would score 1.0 for being "cheapest ever".
+    assert found[0].score == 0.5, "no EUR history yet, so it is unjudgeable, not a bargain"
+
+
+def test_the_market_is_passed_to_the_scouts(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600, market="Serbia")
+    store.upsert_source(a.id, "KupujemProdajem")
+    seen: dict = {}
+    monkeypatch.setattr(
+        "track.engine.scouts.run_scouts",
+        lambda text, hints, **k: seen.update(k) or ScoutResult(),
+    )
+
+    run_assignment(store, a)
+
+    assert seen["market"] == "Serbia"
+
+
+def test_the_market_is_passed_to_source_discovery(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600, market="Serbia")
+    seen: dict = {}
+    monkeypatch.setattr(
+        "track.engine.scouts.discover_sources",
+        lambda text, **k: seen.update(k) or ([], 0.0),
+    )
+
+    ensure_sources(store, a)
+
+    assert seen["market"] == "Serbia"

@@ -52,15 +52,17 @@ def source_stats(findings: list[Finding]) -> list[SourceStat]:
     handing it raw rows would weight a source by how often its listings were
     re-seen rather than by how many it has.
     """
-    by_source: dict[str, list[Finding]] = defaultdict(list)
+    # Keyed by (source, currency), not by source alone: a source quoting in
+    # two currencies has two honest sets of numbers, and a median taken across
+    # them is a number that describes nothing.
+    by_source: dict[tuple[str, str | None], list[Finding]] = defaultdict(list)
     for finding in findings:
-        by_source[finding.source].append(finding)
+        by_source[(finding.source, finding.currency)].append(finding)
 
     stats: list[SourceStat] = []
-    for name, group in by_source.items():
+    for (name, currency), group in by_source.items():
         prices = [f.price for f in group if f.price is not None]
         scores = [f.score for f in group if f.score is not None]
-        currencies = [f.currency for f in group if f.currency]
         stats.append(
             SourceStat(
                 name=name,
@@ -69,10 +71,17 @@ def source_stats(findings: list[Finding]) -> list[SourceStat]:
                 cheapest=min(prices) if prices else None,
                 median=statistics.median(prices) if prices else None,
                 best_score=max(scores) if scores else None,
-                currency=currencies[0] if currencies else None,
+                currency=currency,
             )
         )
     # Sources with no usable price sort last rather than first: an unpriced
-    # source is not a cheap one, it is an unreadable one.
-    stats.sort(key=lambda s: (s.cheapest is None, s.cheapest if s.cheapest is not None else 0.0))
+    # source is not a cheap one, it is an unreadable one. Within that, group by
+    # currency before price -- the ordering is only meaningful inside one.
+    stats.sort(
+        key=lambda s: (
+            s.cheapest is None,
+            s.currency or "",
+            s.cheapest if s.cheapest is not None else 0.0,
+        )
+    )
     return stats

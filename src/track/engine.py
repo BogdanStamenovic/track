@@ -74,7 +74,7 @@ def ensure_sources(
     if not _should_rediscover(assignment, len(existing)):
         return existing, 0.0
     try:
-        discovered, cost = scouts.discover_sources(assignment.text)
+        discovered, cost = scouts.discover_sources(assignment.text, market=assignment.market)
     except TrackError as exc:
         warn(f"source discovery failed: {exc}")
         return existing, 0.0
@@ -137,7 +137,10 @@ def run_assignment(
     run_id = store.start_run(assignment.id)
 
     scouted = scouts.run_scouts(
-        assignment.text, source_names[:DEFAULT_SOURCE_LIMIT], warn=warn
+        assignment.text,
+        source_names[:DEFAULT_SOURCE_LIMIT],
+        market=assignment.market,
+        warn=warn,
     )
     if scouted.blocked:
         warn(
@@ -145,12 +148,18 @@ def run_assignment(
             "the site would not serve one"
         )
 
-    history = store.price_history(assignment.id)  # frozen for the whole run, on purpose
+    # Frozen for the whole run, on purpose, and keyed by currency: a finding
+    # is scored only against others quoted in the same one.
+    history = store.price_history(assignment.id)
     stored: list[Finding] = []
     for raw in scouted.findings:
         key = dedup_key(raw.source, raw.title, raw.url)
         is_new = not store.has_seen(assignment.id, key)
-        score = underpriced_score(raw.price, history) if raw.price is not None else None
+        score = (
+            underpriced_score(raw.price, history.get(raw.currency, []))
+            if raw.price is not None
+            else None
+        )
         stored.append(
             store.add_finding(
                 assignment.id,

@@ -83,6 +83,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_assignment ON runs(assignment_id);
 # open time rather than a migration table: every one is nullable or has a
 # default, so replaying them on an up-to-date database is a no-op.
 _ADDED_COLUMNS = [
+    ("assignments", "market", "TEXT"),
     ("assignments", "notify_agent", "TEXT"),
     ("assignments", "wake_backend", "TEXT"),
     ("assignments", "wake_target", "TEXT"),
@@ -140,6 +141,7 @@ class Store:
         interval_seconds: int,
         max_price: float | None = None,
         *,
+        market: str | None = None,
         notify_agent: str | None = None,
         wake_backend: str | None = None,
         wake_target: str | None = None,
@@ -148,14 +150,15 @@ class Store:
         assignment_id = uuid.uuid4().hex[:8]
         self._conn.execute(
             "INSERT INTO assignments (id, text, interval_seconds, status, max_price, "
-            "created_at, notify_agent, wake_backend, wake_target, wake_on) "
-            "VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+            "created_at, market, notify_agent, wake_backend, wake_target, wake_on) "
+            "VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
             (
                 assignment_id,
                 text,
                 interval_seconds,
                 max_price,
                 _now(),
+                market,
                 notify_agent,
                 wake_backend,
                 wake_target,
@@ -306,9 +309,19 @@ class Store:
         ).fetchall()
         return [_row_to_finding(row) for row in rows]
 
-    def price_history(self, assignment_id: str) -> list[float]:
-        """Current asking prices, one per distinct listing."""
-        return [f.price for f in self.latest_findings(assignment_id) if f.price is not None]
+    def price_history(self, assignment_id: str) -> dict[str | None, list[float]]:
+        """Current asking prices, one per distinct listing, grouped by currency.
+
+        Grouped rather than pooled because the numbers are not comparable
+        across currencies: 3000 RSD against 30 EUR pooled as bare floats makes
+        every dinar-priced listing look like the bargain of the year. A
+        finding is only ever scored against others quoted in its own currency.
+        """
+        history: dict[str | None, list[float]] = {}
+        for f in self.latest_findings(assignment_id):
+            if f.price is not None:
+                history.setdefault(f.currency, []).append(f.price)
+        return history
 
     def has_seen(self, assignment_id: str, dedup_key: str) -> bool:
         row = self._conn.execute(
@@ -386,6 +399,7 @@ def _row_to_assignment(row: sqlite3.Row) -> Assignment:
         next_run_at=row["next_run_at"],
         job_id=row["job_id"],
         backend=row["backend"],
+        market=row["market"],
         notify_agent=row["notify_agent"],
         wake_backend=row["wake_backend"],
         wake_target=row["wake_target"],

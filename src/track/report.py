@@ -78,15 +78,30 @@ def build_summary(
 
     priced_stats = [s for s in (stats or []) if s.cheapest is not None]
     if priced_stats:
-        lines.append("\nCheapest sources so far:")
+        # "Cheapest" only ranks within a currency, so say so when more than one
+        # is present rather than implying 3000 RSD undercuts 30 EUR.
+        currencies = {s.currency for s in priced_stats}
+        heading = (
+            "\nCheapest sources so far (per currency):"
+            if len(currencies) > 1
+            else "\nCheapest sources so far:"
+        )
+        lines.append(heading)
         for s in priced_stats[:TOP_SOURCES]:
             lines.append(
                 f"  {s.name}: from {_money(s.cheapest, s.currency)} "
                 f"(median {_money(s.median, s.currency)}, {s.listings} listings)"
             )
-    unreadable = [s for s in (stats or []) if s.listings and s.priced == 0]
+    # Only sources with *no* readable price anywhere. Stats are keyed by
+    # (source, currency), so a site that quotes in two currencies and also has
+    # some unpriced listings produces an unpriced group as well -- naming it
+    # unreadable next to its own prices reads as a contradiction.
+    priced_names = {s.name for s in (stats or []) if s.priced}
+    unreadable = [
+        s for s in (stats or []) if s.listings and not s.priced and s.name not in priced_names
+    ]
     if unreadable:
-        names = ", ".join(s.name for s in unreadable[:TOP_SOURCES])
+        names = ", ".join(dict.fromkeys(s.name for s in unreadable))
         lines.append(f"  no price readable from: {names}")
 
     if cost_usd:

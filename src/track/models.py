@@ -17,6 +17,7 @@ class Assignment:
     next_run_at: str | None = None
     job_id: str | None = None
     backend: str | None = None  # "wake" | "systemd-timer"
+    market: str | None = None  # where the buyer is; a hard constraint on sources
     notify_agent: str | None = None  # hotline agent whose channel gets the summary
     wake_backend: str | None = None  # "shell" | "rtcwake" | "wol"
     wake_target: str | None = None  # MAC address, for the wol backend
