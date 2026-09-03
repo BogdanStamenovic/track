@@ -16,6 +16,7 @@ from conftest import completed
 
 from track.errors import SchedulerError
 from track.scheduler import (
+    MIN_LEAD_SECONDS,
     RESUME_GRACE_SECONDS,
     cancel,
     resume_task_id_for,
@@ -251,3 +252,60 @@ def test_at_is_always_epoch_seconds_never_a_bare_relative_offset() -> None:
 
     assert not at.startswith("+")
     assert int(at) == int(NOW) + 3600
+
+
+def test_cancelling_a_timer_stops_and_resets_its_service_too(monkeypatch) -> None:
+    """Disabling a timer does not stop the service it triggers."""
+    from track.scheduler import _cancel_systemd_timer
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "track.scheduler.subprocess.run",
+        lambda cmd, **kw: calls.append(cmd) or completed(""),
+    )
+    monkeypatch.setattr("pathlib.Path.unlink", lambda self, missing_ok=False: None)
+
+    _cancel_systemd_timer("track-a1.timer")
+    verbs = [(c[2], c[-1]) for c in calls]
+
+    assert ("disable", "track-a1.timer") in verbs
+    assert ("stop", "track-a1.service") in verbs
+    assert ("reset-failed", "track-a1.service") in verbs
+    assert calls[-1][2] == "daemon-reload", "reload last, after the files are gone"
+
+
+# -- never schedule something already due --------------------------------
+
+
+def test_a_zero_interval_cannot_schedule_a_run_in_the_past() -> None:
+    """Every run re-arms the next, so a past-dated one spins, it doesn't fire once."""
+    calls, runner = _recording()
+    schedule("a1", 0, ["track", "run", "a1"], runner=runner, wake_available=True, now=NOW)
+
+    assert int(_flag(calls[0], "--at")) == int(NOW) + MIN_LEAD_SECONDS
+
+
+def test_a_negative_interval_is_floored_too() -> None:
+    calls, runner = _recording()
+    schedule("a1", -3600, ["track", "run", "a1"], runner=runner, wake_available=True, now=NOW)
+
+    assert int(_flag(calls[0], "--at")) > int(NOW)
+
+
+def test_a_normal_interval_is_left_alone() -> None:
+    calls, runner = _recording()
+    schedule("a1", 3600, ["track", "run", "a1"], runner=runner, wake_available=True, now=NOW)
+
+    assert int(_flag(calls[0], "--at")) == int(NOW) + 3600
+
+
+def test_the_systemd_fallback_is_floored_as_well(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "track.scheduler.subprocess.run", lambda *a, **k: completed("", returncode=0)
+    )
+
+    schedule("a1", 0, ["track", "run", "a1"], wake_available=False, now=NOW)
+
+    unit = (tmp_path / ".config" / "systemd" / "user" / "track-a1.timer").read_text()
+    assert f"OnUnitActiveSec={MIN_LEAD_SECONDS}s" in unit

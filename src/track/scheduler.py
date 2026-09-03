@@ -49,6 +49,15 @@ RESUME_GRACE_SECONDS = 120
 
 RESUME_BACKENDS = ("rtcwake", "wol")
 
+# Never ask for a wakeup that is already due. A scheduler asked to run
+# something at a past time runs it immediately, and since every run re-arms
+# the next one, a past-dated re-arm does not fire once -- it spins as fast as
+# the scheduler polls. Nothing in normal operation produces one (intervals
+# are validated positive at the CLI), which is exactly why it is worth a
+# floor: the ways to get here are a backwards clock step, a zero interval in
+# a hand-edited row, and whatever else turns up at 3am.
+MIN_LEAD_SECONDS = 60
+
 
 class Runner(Protocol):
     def __call__(self, cmd: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]: ...
@@ -64,6 +73,17 @@ class ScheduleResult:
     backend: str  # "wake" | "systemd-timer"
     next_run_at: str  # ISO8601, best-effort
     resume_job_id: str | None = None
+
+
+def _floor_at(base: float, interval_seconds: int) -> int:
+    """The next fire time, never sooner than MIN_LEAD_SECONDS after `base`.
+
+    Floored against the same clock the interval is measured from, rather than
+    against the wall clock: a caller that injects a clock means it, and a
+    scheduler reading a skewed clock is still consistent with itself. What
+    this guards is a non-positive interval reaching the arithmetic.
+    """
+    return int(base + max(interval_seconds, MIN_LEAD_SECONDS))
 
 
 def _isoformat(epoch_seconds: int) -> str:
@@ -158,13 +178,24 @@ def _schedule_systemd_timer(label: str, interval_seconds: int, run_cmd: list[str
 
 
 def _cancel_systemd_timer(job_id: str) -> None:
-    subprocess.run(
-        ["systemctl", "--user", "disable", "--now", job_id],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    """Disable the timer and take its service with it.
+
+    Disabling the timer stops the timer, not the service it triggers. A
+    service left running, mid-activation, or failed keeps a runtime entry
+    after its unit file is deleted -- systemd then holds a job for a unit it
+    can no longer find, which needs a manual `reset-failed` to clear.
+    Observed both, so the service is stopped and reset before the files go.
+    """
     label = job_id.removeprefix("track-").removesuffix(".timer")
+    service = f"track-{label}.service"
+    for argv in (
+        ["disable", "--now", job_id],
+        ["stop", service],
+        ["reset-failed", service],
+    ):
+        subprocess.run(
+            ["systemctl", "--user", *argv], capture_output=True, text=True, check=False
+        )
     service_path, timer_path = _systemd_unit_paths(label)
     service_path.unlink(missing_ok=True)
     timer_path.unlink(missing_ok=True)
@@ -210,14 +241,16 @@ def schedule(
                 f"the {wake_backend} backend needs the `wake` CLI on PATH "
                 "(a systemd timer cannot wake a sleeping machine)"
             )
-        job_id = _schedule_systemd_timer(assignment_id, interval_seconds, run_cmd)
+        job_id = _schedule_systemd_timer(
+            assignment_id, max(interval_seconds, MIN_LEAD_SECONDS), run_cmd
+        )
         return ScheduleResult(
             job_id=job_id,
             backend="systemd-timer",
-            next_run_at=_isoformat(int(base + interval_seconds)),
+            next_run_at=_isoformat(_floor_at(base, interval_seconds)),
         )
 
-    resume_at = int(base + interval_seconds)
+    resume_at = _floor_at(base, interval_seconds)
     resume_job_id: str | None = None
     if wake_backend in RESUME_BACKENDS:
         resume_job_id = _invoke_wake_add(

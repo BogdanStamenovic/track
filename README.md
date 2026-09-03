@@ -183,17 +183,19 @@ the prompt is what stops the scout wasting its budget attempting one.
   scouts wide. `track show` reports the running total per assignment.
 - **The `wake` integration is one file.** `scheduler.py` is the only place
   that knows wake's CLI shape; if that contract changes, nothing else does.
-- **Self-re-arming currently loses a race with `wake fire`.** Verified end to
-  end: the re-arm writes the next `at` and sets the task back to `pending`,
-  then `wake fire` — which marks a task fired only *after* its command
-  returns, and the command is `track run` — stamps `status=fired` over it. The
-  row is left with a correct future time and a dead status, so it never fires
-  again, with nothing logged and exit 0 on both sides. Raised with `wake`;
-  the fix is a compare-and-set on the post-fire write. Until then, schedule
-  through the systemd fallback or re-arm by hand.
+- **Self-re-arming needs `wake` 7041d08 or newer.** Because `track run`
+  re-arms the same task id while wake is still holding it open, an older wake
+  stamped `status=fired` over the re-arm after the command returned — leaving
+  a row with a correct future time and a dead status that never fired again,
+  silently, exit 0 on both sides. Wake's fire path is now a compare-and-set
+  and gives way to a task that re-armed itself. Against an older wake, use
+  the systemd fallback instead.
 - **The systemd fallback is Linux-only and cannot wake a suspended box.**
   It refuses `--wake-backend rtcwake`/`wol` outright rather than pretending.
   Waking a sleeping machine needs `wake` installed.
+- **No wakeup is ever scheduled less than 60s out.** Every run re-arms the
+  next one, so a past-dated wakeup would not fire once — it would spin as
+  fast as the scheduler polls.
 
 ## Not built yet
 
