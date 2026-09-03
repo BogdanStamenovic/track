@@ -41,6 +41,7 @@ def build_summary(
     *,
     stats: list[SourceStat] | None = None,
     cost_usd: float = 0.0,
+    schedule_error: str | None = None,
 ) -> str:
     """A tight Discord-shaped summary of one run."""
     over_ceiling = 0
@@ -90,6 +91,13 @@ def build_summary(
 
     if cost_usd:
         lines.append(f"\n_scouts: ${cost_usd:.3f}_")
+    if schedule_error:
+        # Last line and unmissable: this run is the last one unless someone
+        # intervenes, which is more important than anything it found.
+        lines.append(
+            f"\n**:warning: {schedule_error}** — this assignment will not run "
+            f"again until it is rescheduled (`track resume {assignment.id}`)."
+        )
     return "\n".join(lines)
 
 

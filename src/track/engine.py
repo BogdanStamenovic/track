@@ -18,7 +18,10 @@ Two ordering rules that the correctness of the scores depends on:
 
 from __future__ import annotations
 
+import shutil
+import sys
 from collections.abc import Callable
+from pathlib import Path
 
 from . import scheduler, scouts
 from .errors import TrackError
@@ -28,6 +31,24 @@ from .scoring import dedup_key, source_stats, underpriced_score
 from .store import Store
 
 DEFAULT_SOURCE_LIMIT = 5
+
+
+def run_command(store: Store, assignment_id: str) -> list[str]:
+    """How a scheduler should spell "run this assignment".
+
+    A fired task inherits nothing from the process that scheduled it -- not
+    PATH, not the working directory, not which database was in use. So both
+    are resolved here and written into the task itself: a bare `track` is not
+    on a systemd or wake unit's PATH, and an assignment created in a
+    non-default database would otherwise schedule a run that looks for itself
+    in the default one and reports no such assignment.
+
+    It lives in one function because the re-arm path rewrites the task string
+    every run; the two spellings drifting apart means the first scheduled run
+    works and every one after it does not.
+    """
+    track_bin = shutil.which("track") or str(Path(sys.argv[0]).resolve())
+    return [track_bin, "--db", str(Path(store.db_path).resolve()), "run", assignment_id]
 
 # Re-run source discovery every N runs even when sources are already known.
 # Without this the source list is frozen at whatever the very first scout
@@ -71,26 +92,38 @@ def ensure_sources(
     return names, cost
 
 
-def _rearm_wake(store: Store, assignment: Assignment, *, warn: Callable[[str], None]) -> None:
-    """Arm the next wakeup. Idempotent -- see scheduler.task_id_for."""
+def _rearm_wake(
+    store: Store, assignment: Assignment, *, warn: Callable[[str], None]
+) -> str | None:
+    """Arm the next wakeup. Returns a message if it could not be armed.
+
+    The caller reports that message rather than only logging it, because a
+    failure here is silent and terminal: the assignment simply never runs
+    again, and the stderr of a run nobody launched is read by nobody. It very
+    nearly happened for real -- `wake add --id X` on an existing id raised an
+    IntegrityError until wake e04e149, which would have killed every
+    assignment on its second run with no signal but a line on a dead stream.
+    """
     if assignment.backend != "wake" or assignment.status != "active":
-        return
+        return None
     try:
         result = scheduler.schedule(
             assignment.id,
             assignment.interval_seconds,
-            ["track", "run", assignment.id],
+            run_command(store, assignment.id),
             wake_backend=assignment.wake_backend or "shell",
             target=assignment.wake_target,
             run_on=assignment.wake_on,
             wake_available=True,
         )
     except TrackError as exc:
-        warn(f"could not re-arm next wakeup: {exc}")
-        return
+        message = f"could not schedule the next check: {exc}"
+        warn(message)
+        return message
     store.set_schedule(
         assignment.id, result.job_id, result.backend, result.next_run_at, result.resume_job_id
     )
+    return None
 
 
 def run_assignment(
@@ -138,20 +171,27 @@ def run_assignment(
     store.finish_run(run_id, len(source_names), len(stored), cost)
     store.mark_ran(assignment.id)
 
+    # Re-arm before the summary is built, not after posting it: a run that
+    # cannot schedule its successor is the last one that will ever happen,
+    # and that belongs in the message rather than in a log nobody opens.
+    # Re-read first -- mark_ran bumped runs_count and the row we were handed
+    # is frozen.
+    refreshed = store.get_assignment(assignment.id) or assignment
+    schedule_error = _rearm_wake(store, refreshed, warn=warn)
+
     stats: list[SourceStat] = source_stats(store.latest_findings(assignment.id))
     summary = build_summary(
-        assignment, stored, len(source_names), stats=stats, cost_usd=cost
+        assignment,
+        stored,
+        len(source_names),
+        stats=stats,
+        cost_usd=cost,
+        schedule_error=schedule_error,
     )
     if post:
         try:
             post_summary(summary, agent=assignment.notify_agent)
         except TrackError as exc:
             warn(f"could not post summary: {exc}")
-
-    # Re-read: mark_ran bumped runs_count, and the row we were handed is
-    # frozen. Re-arming off the stale copy would be harmless today but is
-    # exactly the kind of thing that rots.
-    refreshed = store.get_assignment(assignment.id) or assignment
-    _rearm_wake(store, refreshed, warn=warn)
 
     return stored, summary

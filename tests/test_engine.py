@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from track.engine import REDISCOVER_EVERY, ensure_sources, run_assignment
+from track.engine import REDISCOVER_EVERY, ensure_sources, run_assignment, run_command
 from track.errors import ScoutError
 from track.scouts import ScoutFinding, ScoutResult
 from track.store import Store
@@ -296,3 +296,86 @@ def _raiser(exc: Exception):
         raise exc
 
     return boom
+
+
+def test_a_failed_rearm_reaches_discord_not_just_stderr(store: Store, monkeypatch) -> None:
+    """The stderr of a run nobody launched is read by nobody."""
+    from track.errors import SchedulerError
+
+    a = store.add_assignment("a laptop", 3600, notify_agent="track-dev")
+    store.set_schedule(a.id, "job-1", "wake", "2026-01-01T00:00:00+00:00")
+    store.upsert_source(a.id, "eBay")
+    _fake_scouts(monkeypatch, [_sf("t", 10.0)])
+    monkeypatch.setattr(
+        "track.engine.scheduler.schedule",
+        _raiser(SchedulerError("wake add failed: UNIQUE constraint failed")),
+    )
+    posted: list[str] = []
+    monkeypatch.setattr(
+        "track.engine.post_summary", lambda summary, agent=None: posted.append(summary)
+    )
+    warnings: list[str] = []
+
+    findings, _summary = run_assignment(store, a, warn=warnings.append)
+
+    assert "UNIQUE constraint failed" in posted[0]
+    assert "will not run" in posted[0]
+    assert len(findings) == 1, "the run's own findings are still kept"
+    assert any("could not schedule" in w for w in warnings)
+
+
+def test_a_healthy_rearm_leaves_no_warning_in_the_summary(store: Store, monkeypatch) -> None:
+    from track.scheduler import ScheduleResult
+
+    a = store.add_assignment("a laptop", 3600)
+    store.set_schedule(a.id, "job-1", "wake", "2026-01-01T00:00:00+00:00")
+    store.upsert_source(a.id, "eBay")
+    _fake_scouts(monkeypatch, [])
+    monkeypatch.setattr(
+        "track.engine.scheduler.schedule",
+        lambda *a, **k: ScheduleResult("job-2", "wake", "2026-01-01T01:00:00+00:00"),
+    )
+
+    _findings, summary = run_assignment(store, store.get_assignment(a.id) or a)
+    assert "will not run" not in summary
+
+
+# -- what a fired task actually runs --------------------------------------
+
+
+def test_the_scheduled_command_names_the_database_it_was_created_in(
+    store: Store, tmp_path
+) -> None:
+    """A fired task inherits no cwd and no --db; it would find the wrong store."""
+    cmd = run_command(store, "abc123")
+
+    assert "--db" in cmd
+    assert cmd[cmd.index("--db") + 1] == str(store.db_path.resolve())
+    assert cmd[-2:] == ["run", "abc123"]
+
+
+def test_the_scheduled_command_is_an_absolute_path_not_a_bare_name(store: Store) -> None:
+    """systemd and wake units do not share this process's PATH."""
+    assert run_command(store, "abc123")[0].startswith("/")
+
+
+def test_rearming_reproduces_the_same_command_it_was_scheduled_with(
+    store: Store, monkeypatch
+) -> None:
+    """The re-arm rewrites the task string every run; drift means run 2 fails."""
+    from track.scheduler import ScheduleResult
+
+    a = store.add_assignment("a laptop", 3600)
+    store.set_schedule(a.id, "job-1", "wake", "2026-01-01T00:00:00+00:00")
+    store.upsert_source(a.id, "eBay")
+    _fake_scouts(monkeypatch, [])
+    seen: list[list[str]] = []
+    monkeypatch.setattr(
+        "track.engine.scheduler.schedule",
+        lambda aid, interval, cmd, **kw: seen.append(cmd)
+        or ScheduleResult("job-2", "wake", "2026-01-01T01:00:00+00:00"),
+    )
+
+    run_assignment(store, store.get_assignment(a.id) or a)
+
+    assert seen[0] == run_command(store, a.id)

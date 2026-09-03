@@ -213,3 +213,25 @@ def _ok(returncode: int = 0, stderr: str = ""):
     import subprocess
 
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout="", stderr=stderr)
+
+
+# -- a dead assignment must announce itself ------------------------------
+
+
+def test_a_failed_reschedule_is_the_loudest_thing_in_the_summary() -> None:
+    """A run that cannot arm its successor is the last one that will happen."""
+    summary = build_summary(
+        _assignment(),
+        [_finding()],
+        3,
+        schedule_error="could not schedule the next check: wake add failed",
+    )
+
+    assert "wake add failed" in summary
+    assert "will not run\nagain" in summary or "will not run again" in summary
+    assert "track resume a1" in summary
+    assert summary.strip().endswith("."), "it goes last, where it cannot be skimmed past"
+
+
+def test_a_healthy_run_says_nothing_about_scheduling() -> None:
+    assert "warning" not in build_summary(_assignment(), [_finding()], 3)

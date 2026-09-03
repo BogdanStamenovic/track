@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import shutil
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
@@ -24,7 +23,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from . import __version__
-from .engine import run_assignment
+from .engine import run_assignment, run_command
 from .errors import TrackError
 from .models import Assignment
 from .scheduler import cancel as cancel_schedule
@@ -115,26 +114,12 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_command(subcommand: list[str]) -> list[str]:
-    """The absolute command a scheduler should run for a `track` subcommand.
-
-    A scheduled wakeup fires from `wake` or systemd, neither of which shares
-    this process's PATH -- a bare "track" would silently fail at fire time.
-    `sys.argv[0]` is whatever path actually invoked this process, so
-    resolving it gives a path that works however track was installed.
-    """
-    track_bin = shutil.which("track") or str(Path(sys.argv[0]).resolve())
-    return [track_bin, *subcommand]
-
-
-def _arm(
-    store: Store, assignment: Assignment, log: Callable[[str], None]
-) -> None:
+def _arm(store: Store, assignment: Assignment, log: Callable[[str], None]) -> None:
     try:
         result = schedule_wakeup(
             assignment.id,
             assignment.interval_seconds,
-            _run_command(["run", assignment.id]),
+            run_command(store, assignment.id),
             wake_backend=assignment.wake_backend or "shell",
             target=assignment.wake_target,
             run_on=assignment.wake_on,
