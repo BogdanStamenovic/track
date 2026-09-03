@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from track.errors import ReportError
@@ -80,12 +82,95 @@ def test_new_listings_are_ranked_by_score() -> None:
     assert body.index("bargain") < body.index("cheap-ish") < body.index("meh")
 
 
-def test_only_the_top_five_are_listed_and_the_rest_are_counted() -> None:
-    findings = [_finding(f"item{i}", 100.0 + i, 0.5) for i in range(9)]
+def test_a_thin_run_is_ranked_not_tiered() -> None:
+    """Thirds drawn from a handful of listings describe the sample, not the market."""
+    findings = [_finding(f"item{i}", 100.0 + i, 0.5) for i in range(4)]
+    summary = build_summary(_assignment(), findings, 3)
+
+    assert "Budget" not in summary
+    assert summary.count("• ") == 4
+
+
+def test_only_the_top_five_are_listed_when_ranking() -> None:
+    findings = [_finding(f"item{i}", 100.0 + i, 0.5, url=None) for i in range(5)]
+    findings += [_finding(f"noprice{i}", None, None, url=None) for i in range(4)]
     summary = build_summary(_assignment(), findings, 3)
 
     assert summary.count("• ") == 5
-    assert "and 4 more new listings" in summary
+    assert "and 4 more" in summary
+
+
+# -- tiering --------------------------------------------------------------
+
+
+def _priced(n: int, base: float = 100.0, currency: str = "EUR", offset: int = 0) -> list[Finding]:
+    return [
+        Finding(
+            id=offset + i,
+            assignment_id="a1",
+            run_id=1,
+            source="KP",
+            title=f"laptop{offset + i}",
+            price=base + i * 100,
+            currency=currency,
+            url=f"https://x/{offset + i}",
+            dedup_key=f"k{offset + i}",
+            score=0.5,
+            is_new=True,
+            found_at="2026-09-03T00:00:00+00:00",
+        )
+        for i in range(n)
+    ]
+
+
+def test_enough_listings_are_presented_as_budget_mid_and_stretch() -> None:
+    summary = build_summary(_assignment(), _priced(9), 3)
+
+    assert "**Budget**" in summary
+    assert "**Mid**" in summary
+    assert "**Stretch**" in summary
+
+
+def test_tiers_are_cut_by_price_low_to_high() -> None:
+    summary = build_summary(_assignment(), _priced(9), 3)
+    budget = summary.index("**Budget**")
+    mid = summary.index("**Mid**")
+    stretch = summary.index("**Stretch**")
+
+    def price_after(i: int) -> float:
+        return float(summary[i:].split("· ")[1].split(" ")[0].replace(",", ""))
+
+    assert price_after(budget) < price_after(mid) < price_after(stretch)
+
+
+def test_a_tier_picks_the_best_scoring_listing_not_the_cheapest() -> None:
+    """The cheapest thing in a band is usually the worst specified one."""
+    band = _priced(9)
+    band[1] = replace(band[1], score=0.99, title="well specified")
+    summary = build_summary(_assignment(), band, 3)
+
+    assert "well specified" in summary
+    assert "laptop0" not in summary, "the cheapest of the band should have lost to it"
+
+
+def test_tiers_are_cut_within_one_currency_only() -> None:
+    """Thirds across currencies sort every dinar into stretch by digit count."""
+    eur = _priced(9, base=100.0, currency="EUR")
+    rsd = _priced(2, base=50000.0, currency="RSD", offset=100)
+    summary = build_summary(_assignment(), eur + rsd, 3)
+
+    assert "**Stretch**" in summary
+    stretch_line = summary[summary.index("**Stretch**"):].split("\n")[0]
+    assert "EUR" in stretch_line, "the dinar prices must not have captured the top tier"
+    assert "Also new in RSD (2)" in summary
+    assert "Tiers below are EUR listings" in summary, (
+        "a reader must not read the other currency's absence from the tiers as a verdict"
+    )
+
+
+def test_a_single_currency_run_gets_no_currency_caveat() -> None:
+    summary = build_summary(_assignment(), _priced(9), 3)
+    assert "Tiers below are" not in summary
 
 
 def test_an_unknown_price_is_labelled_not_guessed() -> None:

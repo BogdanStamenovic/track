@@ -36,6 +36,7 @@ track list [--json]
 track show <assignment-id> [--limit N] [--json]
 track sources <assignment-id> [--json]
 track run <assignment-id> [--no-post] [--force]
+track unschedule <assignment-id>
 track pause <assignment-id>
 track resume <assignment-id>
 track remove <assignment-id>
@@ -50,6 +51,7 @@ track remove <assignment-id>
 | `--wake-backend` | `shell` for a machine that stays up; `rtcwake`/`wol` to resume a sleeping one first |
 | `--wake-target` | MAC address, for `--wake-backend wol` |
 | `--wake-on` | wake origin name of the machine that should run the check |
+| `unschedule` | drop track's own recurring wakeup but keep the assignment runnable, for when an external scheduler owns the timing |
 | `--no-post` | run without posting to Discord |
 | `--force` | run an assignment that is paused |
 | `-v, --verbose` | detailed progress on stderr |
@@ -57,8 +59,23 @@ track remove <assignment-id>
 | `--db PATH` | override the sqlite path (default `~/.local/share/track/track.db`) |
 | `--version` | print the version and exit |
 
-Exit codes: `0` success, `1` an operation failed, `2` usage error. stdout
-carries real output only — assignment ids, listings, summaries; everything
+Exit codes: `0` success, `1` an operation failed, `2` usage error. `track run`
+refines that, because it is the command a scheduler fires with nobody watching
+and its exit status is the only signal that reaches anyone:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | a summary was posted and it contained at least one usable finding |
+| `1` | a summary was posted, honestly, but there was nothing usable in it |
+| `2` | usage error |
+| `3` | the summary could not be posted at all |
+
+"Ran but found nothing" is deliberately not `0`: silence and success must not
+look alike to whatever fired the run. A report that never reached its channel
+gets its own code rather than being folded into a generic failure, because it
+is the one outcome nobody will otherwise hear about.
+
+stdout carries real output only — assignment ids, listings, summaries; everything
 else goes to stderr.
 
 ### Example
@@ -104,6 +121,16 @@ stores on another continent. Set it and it becomes a hard constraint in the
 scout prompt: local marketplaces and classifieds, sellers who actually ship
 there, local-language sites over international ones. Export `TRACK_MARKET`
 once rather than passing it every time. `track add` warns when neither is set.
+
+**Tiers.** Once a run has enough priced findings in one currency, the summary
+leads with budget / mid / stretch rather than a flat ranked list, picking the
+best-*scoring* listing in each band rather than the cheapest — the cheapest
+thing in the budget band is usually the one with the worst specifications, and
+the question being answered is "what is the best buy at roughly this price".
+Below that threshold it falls back to a ranked list, because thirds drawn from
+four listings describe the sample rather than the market. Tiers are cut inside
+a single currency and the summary says which, since track does not convert and
+the other currency's listings are genuinely unranked against them.
 
 **Scoring is per currency.** A finding is only ever compared against others
 quoted in the same currency. Pooling them as bare numbers would rank every

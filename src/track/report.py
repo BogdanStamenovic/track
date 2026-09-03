@@ -27,11 +27,38 @@ _FALLBACK_PATH = Path.home() / ".claude" / "bin" / HOTLINE_SAY_BIN
 TOP_N = 5
 TOP_SOURCES = 3
 
+# Below this many priced finds, thirds are noise -- "budget / mid / stretch"
+# drawn from four listings says more about the sample than the market.
+MIN_FOR_TIERS = 6
+
 
 def _money(price: float | None, currency: str | None) -> str:
     if price is None:
         return "price unknown"
     return f"{price:,.2f} {currency}" if currency else f"{price:,.2f}"
+
+
+def _tier(findings: list[Finding]) -> list[tuple[str, Finding]]:
+    """Split priced finds into budget / mid / stretch and pick one of each.
+
+    Tiers are cut by price within a single currency -- see the caller, which
+    only ever hands over one currency's worth. Within a tier the pick is the
+    highest-scoring listing, not the cheapest, because the cheapest thing in
+    the budget tier is usually the one with the worst specifications and the
+    question being answered is "what is the best buy at roughly this price".
+    """
+    ranked = sorted(findings, key=lambda f: f.price or 0.0)
+    third = max(1, len(ranked) // 3)
+    bands = [
+        ("Budget", ranked[:third]),
+        ("Mid", ranked[third : third * 2]),
+        ("Stretch", ranked[third * 2 :]),
+    ]
+    out: list[tuple[str, Finding]] = []
+    for label, band in bands:
+        if band:
+            out.append((label, max(band, key=lambda f: (f.score or 0.0, -(f.price or 0.0)))))
+    return out
 
 
 def build_summary(
@@ -76,15 +103,7 @@ def build_summary(
         else:
             lines.append("\nNothing new this run.")
     else:
-        ranked = sorted(new_findings, key=lambda f: (f.score if f.score is not None else -1.0), reverse=True)
-        lines.append("")
-        for f in ranked[:TOP_N]:
-            score_tag = f" · score {f.score:.2f}" if f.score is not None else ""
-            lines.append(f"• **{f.title}** — {_money(f.price, f.currency)} @ {f.source}{score_tag}")
-            if f.url:
-                lines.append(f"  <{f.url}>")
-        if len(ranked) > TOP_N:
-            lines.append(f"…and {len(ranked) - TOP_N} more new listings.")
+        lines.extend(_body(new_findings))
 
     priced_stats = [s for s in (stats or []) if s.cheapest is not None]
     if priced_stats:
@@ -126,6 +145,58 @@ def build_summary(
             f"again until it is rescheduled (`track resume {assignment.id}`)."
         )
     return "\n".join(lines)
+
+
+def _body(new_findings: list[Finding]) -> list[str]:
+    """The findings section: tiered when there is enough to tier, ranked when not."""
+    priced_by_currency: dict[str | None, list[Finding]] = {}
+    for f in new_findings:
+        if f.price is not None:
+            priced_by_currency.setdefault(f.currency, []).append(f)
+
+    # Tier within the currency that has the most listings. Cutting thirds
+    # across currencies would sort every dinar price into "stretch" and every
+    # euro one into "budget" purely by the size of the number.
+    main_group: list[Finding] = []
+    if priced_by_currency:
+        main_group = max(priced_by_currency.values(), key=len)
+
+    if len(main_group) < MIN_FOR_TIERS:
+        return _ranked_lines(new_findings, TOP_N)
+
+    lines = [""]
+    if len(priced_by_currency) > 1:
+        # Say which currency the tiers came from. track does not convert, so
+        # the other currency's listings are genuinely unranked against these,
+        # and a reader who does not know that will read their absence from the
+        # tiers as a judgement on them.
+        currency = main_group[0].currency or "unpriced"
+        lines.append(f"_Tiers below are {currency} listings; other currencies follow._")
+    for label, f in _tier(main_group):
+        lines.append(f"**{label}** · {_money(f.price, f.currency)} — {f.title} @ {f.source}")
+        if f.url:
+            lines.append(f"  <{f.url}>")
+
+    others = [f for f in new_findings if f not in main_group]
+    if others:
+        other_currencies = sorted({f.currency for f in others if f.currency})
+        tag = f" in {', '.join(other_currencies)}" if other_currencies else ""
+        lines.append(f"\nAlso new{tag} ({len(others)}), best first:")
+        lines.extend(_ranked_lines(others, 3)[1:])
+    return lines
+
+
+def _ranked_lines(findings: list[Finding], limit: int) -> list[str]:
+    ranked = sorted(findings, key=lambda f: (f.score if f.score is not None else -1.0), reverse=True)
+    lines = [""]
+    for f in ranked[:limit]:
+        score_tag = f" · score {f.score:.2f}" if f.score is not None else ""
+        lines.append(f"• **{f.title}** — {_money(f.price, f.currency)} @ {f.source}{score_tag}")
+        if f.url:
+            lines.append(f"  <{f.url}>")
+    if len(ranked) > limit:
+        lines.append(f"…and {len(ranked) - limit} more.")
+    return lines
 
 
 def _resolve_hotline_say() -> str:
