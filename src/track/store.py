@@ -1,9 +1,17 @@
 """SQLite persistence for track: assignments, sources, findings, runs.
 
-Findings are append-only: every run's rows are inserted, never rewritten or
-rescored. `underpriced_score` is computed against the price history that
-existed *at the time* of that finding -- a later run's prices don't reach
-back and change how an earlier finding was scored.
+Findings are append-only. Every run inserts its rows and nothing ever
+rewrites or rescores an earlier one -- a finding's score is the score it
+earned against the price history that existed when it was found, and a
+later run's cheaper listing does not reach back and demote it.
+
+Two consequences that shape the queries below. First, the same listing
+legitimately appears many times (that is how a price drop is visible), so
+anything reasoning about "the current market" reads `latest_findings`, which
+collapses each listing to its most recent row. Second, statistics about who
+sells cheap are *derived* from findings rather than kept as counters on
+`sources`, because a counter can drift out of step with the rows it claims
+to summarise and a query cannot.
 """
 
 from __future__ import annotations
@@ -14,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .errors import StoreError
-from .models import Assignment, Finding, Source
+from .models import Assignment, Finding, Run, Source
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS assignments (
@@ -68,7 +76,21 @@ CREATE TABLE IF NOT EXISTS findings (
 
 CREATE INDEX IF NOT EXISTS idx_findings_assignment ON findings(assignment_id);
 CREATE INDEX IF NOT EXISTS idx_findings_dedup ON findings(assignment_id, dedup_key);
+CREATE INDEX IF NOT EXISTS idx_runs_assignment ON runs(assignment_id);
 """
+
+# Columns added after the first schema shipped. Applied with ADD COLUMN at
+# open time rather than a migration table: every one is nullable or has a
+# default, so replaying them on an up-to-date database is a no-op.
+_ADDED_COLUMNS = [
+    ("assignments", "notify_agent", "TEXT"),
+    ("assignments", "wake_backend", "TEXT"),
+    ("assignments", "wake_target", "TEXT"),
+    ("assignments", "wake_on", "TEXT"),
+    ("assignments", "resume_job_id", "TEXT"),
+    ("assignments", "runs_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("runs", "cost_usd", "REAL NOT NULL DEFAULT 0"),
+]
 
 
 def _now() -> str:
@@ -90,7 +112,16 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        for table, column, decl in _ADDED_COLUMNS:
+            existing = {
+                row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         self._conn.close()
@@ -104,14 +135,32 @@ class Store:
     # -- assignments ---------------------------------------------------
 
     def add_assignment(
-        self, text: str, interval_seconds: int, max_price: float | None = None
+        self,
+        text: str,
+        interval_seconds: int,
+        max_price: float | None = None,
+        *,
+        notify_agent: str | None = None,
+        wake_backend: str | None = None,
+        wake_target: str | None = None,
+        wake_on: str | None = None,
     ) -> Assignment:
         assignment_id = uuid.uuid4().hex[:8]
         self._conn.execute(
             "INSERT INTO assignments (id, text, interval_seconds, status, max_price, "
-            "created_at, last_run_at, next_run_at, job_id, backend) "
-            "VALUES (?, ?, ?, 'active', ?, ?, NULL, NULL, NULL, NULL)",
-            (assignment_id, text, interval_seconds, max_price, _now()),
+            "created_at, notify_agent, wake_backend, wake_target, wake_on) "
+            "VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+            (
+                assignment_id,
+                text,
+                interval_seconds,
+                max_price,
+                _now(),
+                notify_agent,
+                wake_backend,
+                wake_target,
+                wake_on,
+            ),
         )
         self._conn.commit()
         assignment = self.get_assignment(assignment_id)
@@ -130,17 +179,24 @@ class Store:
         return [_row_to_assignment(row) for row in rows]
 
     def set_schedule(
-        self, assignment_id: str, job_id: str, backend: str, next_run_at: str
+        self,
+        assignment_id: str,
+        job_id: str,
+        backend: str,
+        next_run_at: str,
+        resume_job_id: str | None = None,
     ) -> None:
         self._conn.execute(
-            "UPDATE assignments SET job_id = ?, backend = ?, next_run_at = ? WHERE id = ?",
-            (job_id, backend, next_run_at, assignment_id),
+            "UPDATE assignments SET job_id = ?, backend = ?, next_run_at = ?, "
+            "resume_job_id = ? WHERE id = ?",
+            (job_id, backend, next_run_at, resume_job_id, assignment_id),
         )
         self._conn.commit()
 
     def clear_schedule(self, assignment_id: str) -> None:
         self._conn.execute(
-            "UPDATE assignments SET job_id = NULL, backend = NULL, next_run_at = NULL WHERE id = ?",
+            "UPDATE assignments SET job_id = NULL, backend = NULL, next_run_at = NULL, "
+            "resume_job_id = NULL WHERE id = ?",
             (assignment_id,),
         )
         self._conn.commit()
@@ -153,7 +209,8 @@ class Store:
 
     def mark_ran(self, assignment_id: str) -> None:
         self._conn.execute(
-            "UPDATE assignments SET last_run_at = ? WHERE id = ?", (_now(), assignment_id)
+            "UPDATE assignments SET last_run_at = ?, runs_count = runs_count + 1 WHERE id = ?",
+            (_now(), assignment_id),
         )
         self._conn.commit()
 
@@ -189,7 +246,7 @@ class Store:
 
     def list_sources(self, assignment_id: str) -> list[Source]:
         rows = self._conn.execute(
-            "SELECT * FROM sources WHERE assignment_id = ? ORDER BY times_seen DESC",
+            "SELECT * FROM sources WHERE assignment_id = ? ORDER BY times_seen DESC, name",
             (assignment_id,),
         ).fetchall()
         return [_row_to_source(row) for row in rows]
@@ -207,21 +264,51 @@ class Store:
             raise StoreError("run insert did not produce a rowid")
         return run_id
 
-    def finish_run(self, run_id: int, scout_count: int, findings_count: int) -> None:
+    def finish_run(
+        self, run_id: int, scout_count: int, findings_count: int, cost_usd: float = 0.0
+    ) -> None:
         self._conn.execute(
-            "UPDATE runs SET finished_at = ?, scout_count = ?, findings_count = ? WHERE id = ?",
-            (_now(), scout_count, findings_count, run_id),
+            "UPDATE runs SET finished_at = ?, scout_count = ?, findings_count = ?, "
+            "cost_usd = ? WHERE id = ?",
+            (_now(), scout_count, findings_count, cost_usd, run_id),
         )
         self._conn.commit()
 
+    def list_runs(self, assignment_id: str, limit: int = 10) -> list[Run]:
+        rows = self._conn.execute(
+            "SELECT * FROM runs WHERE assignment_id = ? ORDER BY id DESC LIMIT ?",
+            (assignment_id, limit),
+        ).fetchall()
+        return [_row_to_run(row) for row in rows]
+
+    def total_cost(self, assignment_id: str) -> float:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS total FROM runs WHERE assignment_id = ?",
+            (assignment_id,),
+        ).fetchone()
+        return float(row["total"])
+
     # -- findings ------------------------------------------------------------
 
-    def price_history(self, assignment_id: str) -> list[float]:
+    def latest_findings(self, assignment_id: str) -> list[Finding]:
+        """One row per distinct listing: the most recent sighting of each.
+
+        Everything that reasons about the current market goes through here.
+        Reading the raw findings table instead would count a listing once per
+        run it survived, so a stale listing nobody wants would outvote a
+        genuinely rare cheap one purely by being re-seen.
+        """
         rows = self._conn.execute(
-            "SELECT price FROM findings WHERE assignment_id = ? AND price IS NOT NULL",
+            "SELECT * FROM findings WHERE id IN ("
+            "  SELECT MAX(id) FROM findings WHERE assignment_id = ? GROUP BY dedup_key"
+            ") ORDER BY id DESC",
             (assignment_id,),
         ).fetchall()
-        return [row["price"] for row in rows]
+        return [_row_to_finding(row) for row in rows]
+
+    def price_history(self, assignment_id: str) -> list[float]:
+        """Current asking prices, one per distinct listing."""
+        return [f.price for f in self.latest_findings(assignment_id) if f.price is not None]
 
     def has_seen(self, assignment_id: str, dedup_key: str) -> bool:
         row = self._conn.execute(
@@ -274,11 +361,17 @@ class Store:
         return [_row_to_finding(row) for row in rows]
 
     def best_findings(self, assignment_id: str, limit: int = 5) -> list[Finding]:
-        rows = self._conn.execute(
-            "SELECT * FROM findings WHERE assignment_id = ? ORDER BY score DESC LIMIT ?",
-            (assignment_id, limit),
-        ).fetchall()
-        return [_row_to_finding(row) for row in rows]
+        """Top listings by score, one entry per listing.
+
+        Ranking the raw table would fill the whole list with repeat sightings
+        of a single good listing.
+        """
+        ranked = sorted(
+            self.latest_findings(assignment_id),
+            key=lambda f: (f.score if f.score is not None else -1.0),
+            reverse=True,
+        )
+        return ranked[:limit]
 
 
 def _row_to_assignment(row: sqlite3.Row) -> Assignment:
@@ -293,6 +386,12 @@ def _row_to_assignment(row: sqlite3.Row) -> Assignment:
         next_run_at=row["next_run_at"],
         job_id=row["job_id"],
         backend=row["backend"],
+        notify_agent=row["notify_agent"],
+        wake_backend=row["wake_backend"],
+        wake_target=row["wake_target"],
+        wake_on=row["wake_on"],
+        resume_job_id=row["resume_job_id"],
+        runs_count=row["runs_count"],
     )
 
 
@@ -306,6 +405,18 @@ def _row_to_source(row: sqlite3.Row) -> Source:
         times_seen=row["times_seen"],
         first_seen_at=row["first_seen_at"],
         last_seen_at=row["last_seen_at"],
+    )
+
+
+def _row_to_run(row: sqlite3.Row) -> Run:
+    return Run(
+        id=row["id"],
+        assignment_id=row["assignment_id"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        scout_count=row["scout_count"],
+        findings_count=row["findings_count"],
+        cost_usd=row["cost_usd"],
     )
 
 

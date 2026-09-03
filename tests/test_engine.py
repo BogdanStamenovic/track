@@ -1,136 +1,298 @@
+"""Engine tests: one research cycle, end to end, with the scouts faked out."""
+
 from __future__ import annotations
 
-from track.engine import ensure_sources, run_assignment
-from track.errors import TrackError
-from track.scouts import ScoutFinding
+import pytest
+
+from track.engine import REDISCOVER_EVERY, ensure_sources, run_assignment
+from track.errors import ScoutError
+from track.scouts import ScoutFinding, ScoutResult
 from track.store import Store
 
 
-def test_ensure_sources_uses_existing_when_present(store: Store, monkeypatch) -> None:
-    a = store.add_assignment("laptops", 3600)
-    store.upsert_source(a.id, "eBay", "https://ebay.com")
-
-    def fail_discover(*args, **kwargs):
-        raise AssertionError("should not re-discover when sources already exist")
-
-    monkeypatch.setattr("track.engine.scouts.discover_sources", fail_discover)
-    names = ensure_sources(store, a)
-    assert names == ["eBay"]
+@pytest.fixture(autouse=True)
+def no_posting(monkeypatch):
+    """Nothing in this module may reach Discord or a scheduler."""
+    monkeypatch.setattr("track.engine.post_summary", lambda *a, **k: None)
+    monkeypatch.setattr("track.engine.scheduler.schedule", _unexpected("schedule"))
 
 
-def test_ensure_sources_discovers_when_empty(store: Store, monkeypatch) -> None:
-    a = store.add_assignment("laptops", 3600)
+def _unexpected(what: str):
+    def boom(*a, **k):
+        raise AssertionError(f"{what} should not have been called")
 
-    monkeypatch.setattr(
-        "track.engine.scouts.discover_sources",
-        lambda text, **kw: [{"source": "eBay", "url": "https://ebay.com", "notes": "cheap"}],
-    )
-    names = ensure_sources(store, a)
-    assert names == ["eBay"]
-    assert store.list_sources(a.id)[0].name == "eBay"
+    return boom
 
 
-def test_ensure_sources_warns_and_returns_empty_on_failure(store: Store, monkeypatch) -> None:
-    a = store.add_assignment("laptops", 3600)
-
-    def boom(*args, **kwargs):
-        raise TrackError("network down")
-
-    monkeypatch.setattr("track.engine.scouts.discover_sources", boom)
-    warnings = []
-    names = ensure_sources(store, a, warn=warnings.append)
-    assert names == []
-    assert any("network down" in w for w in warnings)
-
-
-def test_run_assignment_scores_against_history(store: Store, monkeypatch) -> None:
-    a = store.add_assignment("laptops", 3600)
-    store.upsert_source(a.id, "eBay")
-
+def _fake_scouts(monkeypatch, findings, *, cost=0.0, blocked=0):
     monkeypatch.setattr(
         "track.engine.scouts.run_scouts",
-        lambda text, sources, **kw: [
-            ScoutFinding(source="eBay", title="ThinkPad", price=100.0, currency="USD", url="https://x/1")
-        ],
+        lambda *a, **k: ScoutResult(findings=list(findings), cost_usd=cost, blocked=blocked),
     )
-    monkeypatch.setattr("track.engine.post_summary", lambda summary, **kw: None)
-
-    findings, summary = run_assignment(store, a, post=True)
-    assert len(findings) == 1
-    assert findings[0].score == 0.5  # no prior history yet
-    assert findings[0].is_new is True
-    assert "ThinkPad" in summary
 
 
-def test_run_assignment_marks_repeat_finding_not_new(store: Store, monkeypatch) -> None:
-    a = store.add_assignment("laptops", 3600)
+def _fake_discovery(monkeypatch, sources, *, cost=0.0):
+    monkeypatch.setattr(
+        "track.engine.scouts.discover_sources", lambda *a, **k: (list(sources), cost)
+    )
+
+
+def _sf(title: str, price: float | None, source: str = "eBay", url: str | None = None):
+    return ScoutFinding(source, title, price, "USD", url or f"https://x/{title}")
+
+
+# -- source discovery ----------------------------------------------------
+
+
+def test_discovery_runs_when_an_assignment_has_no_sources(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    _fake_discovery(monkeypatch, [{"source": "eBay", "url": "https://ebay.com", "notes": "cheap"}])
+
+    names, cost = ensure_sources(store, a)
+
+    assert names == ["eBay"]
+    assert [s.name for s in store.list_sources(a.id)] == ["eBay"]
+    assert cost == 0.0
+
+
+def test_discovery_is_skipped_when_sources_are_already_known(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600)
     store.upsert_source(a.id, "eBay")
+    monkeypatch.setattr("track.engine.scouts.discover_sources", _unexpected("discover_sources"))
 
-    same_finding = ScoutFinding(
-        source="eBay", title="ThinkPad", price=100.0, currency="USD", url="https://x/1"
-    )
-    monkeypatch.setattr("track.engine.scouts.run_scouts", lambda text, sources, **kw: [same_finding])
-    monkeypatch.setattr("track.engine.post_summary", lambda summary, **kw: None)
+    assert ensure_sources(store, a)[0] == ["eBay"]
 
-    first, _ = run_assignment(store, a, post=True)
-    second, _ = run_assignment(store, a, post=True)
-    assert first[0].is_new is True
+
+def test_discovery_repeats_periodically_so_the_source_list_cannot_ossify(
+    store: Store, monkeypatch
+) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    store.upsert_source(a.id, "eBay")
+    for _ in range(REDISCOVER_EVERY):
+        store.mark_ran(a.id)
+    refreshed = store.get_assignment(a.id)
+    assert refreshed is not None
+    _fake_discovery(monkeypatch, [{"source": "Craigslist"}])
+
+    names, _cost = ensure_sources(store, refreshed)
+
+    assert names == ["eBay", "Craigslist"]
+
+
+def test_failed_discovery_warns_and_keeps_what_is_known(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600)
+
+    def boom(*args, **kwargs):
+        raise ScoutError("claude CLI not found on PATH")
+
+    monkeypatch.setattr("track.engine.scouts.discover_sources", boom)
+    warnings: list[str] = []
+
+    names, _cost = ensure_sources(store, a, warn=warnings.append)
+
+    assert names == []
+    assert any("source discovery failed" in w for w in warnings)
+
+
+# -- a run ---------------------------------------------------------------
+
+
+def test_a_run_stores_scores_and_summarises(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    store.upsert_source(a.id, "eBay")
+    _fake_scouts(monkeypatch, [_sf("ThinkPad", 300.0)], cost=0.12)
+
+    findings, summary = run_assignment(store, a)
+
+    assert len(findings) == 1
+    assert findings[0].is_new is True
+    assert findings[0].score == 0.5  # no history yet
+    assert "ThinkPad" in summary
+    assert store.total_cost(a.id) == pytest.approx(0.12)
+    refreshed = store.get_assignment(a.id)
+    assert refreshed is not None and refreshed.runs_count == 1
+
+
+def test_the_second_sighting_of_a_listing_is_not_new(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    store.upsert_source(a.id, "eBay")
+    _fake_scouts(monkeypatch, [_sf("ThinkPad", 300.0)])
+
+    run_assignment(store, a)
+    second, _summary = run_assignment(store, store.get_assignment(a.id) or a)
+
     assert second[0].is_new is False
 
 
-def test_run_assignment_report_failure_does_not_raise(store: Store, monkeypatch) -> None:
-    a = store.add_assignment("laptops", 3600)
+def test_scores_do_not_depend_on_which_scout_returned_first(tmp_path, monkeypatch) -> None:
+    """History is frozen at run start; extending it mid-run made scores order-dependent."""
+    batch = [_sf("a", 100.0), _sf("b", 200.0), _sf("c", 300.0)]
+
+    def scores_for(label, order):
+        with Store(tmp_path / f"{label}.db") as s:
+            assignment = s.add_assignment("a laptop", 3600)
+            s.upsert_source(assignment.id, "eBay")
+            # Seed history first, otherwise every score is the neutral 0.5 and
+            # the comparison below would hold even for an order-dependent scorer.
+            _fake_scouts(monkeypatch, [_sf("seed", 250.0)])
+            run_assignment(s, assignment)
+            _fake_scouts(monkeypatch, order)
+            found, _summary = run_assignment(s, s.get_assignment(assignment.id) or assignment)
+            return {f.title: f.score for f in found}
+
+    forwards = scores_for("fwd", batch)
+    backwards = scores_for("rev", list(reversed(batch)))
+
+    assert forwards == backwards
+    assert forwards["a"] == 1.0, "cheaper than the seed"
+    assert forwards["c"] == 0.0, "dearer than the seed"
+
+
+def test_a_price_drop_is_scored_against_the_history_that_existed(
+    store: Store, monkeypatch
+) -> None:
+    a = store.add_assignment("a laptop", 3600)
     store.upsert_source(a.id, "eBay")
-    monkeypatch.setattr("track.engine.scouts.run_scouts", lambda text, sources, **kw: [])
 
-    def boom(summary, **kw):
-        raise TrackError("discord down")
+    _fake_scouts(monkeypatch, [_sf("expensive", 900.0)])
+    run_assignment(store, a)
 
-    monkeypatch.setattr("track.engine.post_summary", boom)
-    warnings = []
-    run_assignment(store, a, warn=warnings.append, post=True)
-    assert any("discord down" in w for w in warnings)
+    _fake_scouts(monkeypatch, [_sf("bargain", 100.0)])
+    second, _summary = run_assignment(store, store.get_assignment(a.id) or a)
+
+    assert second[0].score == 1.0
 
 
-def test_run_assignment_rearms_wake_backend(store: Store, monkeypatch) -> None:
-    a = store.add_assignment("laptops", 3600)
-    store.set_schedule(a.id, "task-1", "wake", "then")
-    a = store.get_assignment(a.id)
-    assert a is not None
+def test_an_earlier_finding_is_never_rescored(store: Store, monkeypatch) -> None:
+    """Append-only: a later cheaper listing must not demote yesterday's row."""
+    a = store.add_assignment("a laptop", 3600)
     store.upsert_source(a.id, "eBay")
 
-    monkeypatch.setattr("track.engine.scouts.run_scouts", lambda text, sources, **kw: [])
-    monkeypatch.setattr("track.engine.post_summary", lambda summary, **kw: None)
+    _fake_scouts(monkeypatch, [_sf("first", 500.0)])
+    (first,), _summary = run_assignment(store, a)
+    original_score = first.score
 
-    calls = []
+    _fake_scouts(monkeypatch, [_sf("cheaper", 10.0)])
+    run_assignment(store, store.get_assignment(a.id) or a)
 
-    def fake_schedule(assignment_id, interval_seconds, cmd, **kw):
-        calls.append((assignment_id, interval_seconds))
-        from track.scheduler import ScheduleResult
+    still_there = next(f for f in store.latest_findings(a.id) if f.title == "first")
+    assert still_there.score == original_score
 
-        return ScheduleResult(job_id="task-2", backend="wake", next_run_at="later")
 
-    monkeypatch.setattr("track.engine.scheduler.schedule", fake_schedule)
+def test_an_unpriced_listing_is_stored_unscored_not_dropped(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    store.upsert_source(a.id, "eBay")
+    _fake_scouts(monkeypatch, [_sf("blocked", None)], blocked=1)
+
+    warnings: list[str] = []
+    findings, _summary = run_assignment(store, a, warn=warnings.append)
+
+    assert findings[0].price is None
+    assert findings[0].score is None
+    assert any("without a price" in w for w in warnings)
+
+
+def test_scouted_sources_are_learned(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    store.upsert_source(a.id, "eBay")
+    _fake_scouts(monkeypatch, [_sf("t", 10.0, source="Marktplaats")])
+
+    run_assignment(store, a)
+
+    assert "Marktplaats" in {s.name for s in store.list_sources(a.id)}
+
+
+def test_no_sources_yields_an_honest_empty_run(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    _fake_discovery(monkeypatch, [])
+    _fake_scouts(monkeypatch, [])
+
+    findings, summary = run_assignment(store, a)
+
+    assert findings == []
+    assert "Nothing new this run." in summary
+
+
+# -- posting and re-arming ------------------------------------------------
+
+
+def test_the_summary_goes_to_the_assignments_own_agent(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600, notify_agent="track-dev")
+    store.upsert_source(a.id, "eBay")
+    _fake_scouts(monkeypatch, [_sf("t", 10.0)])
+    seen: dict = {}
+    monkeypatch.setattr(
+        "track.engine.post_summary", lambda summary, agent=None: seen.update(agent=agent)
+    )
+
     run_assignment(store, a, post=True)
 
-    assert calls == [(a.id, 3600)]
-    updated = store.get_assignment(a.id)
-    assert updated is not None
-    assert updated.job_id == "task-2"
+    assert seen["agent"] == "track-dev"
 
 
-def test_run_assignment_does_not_rearm_systemd_timer(store: Store, monkeypatch) -> None:
-    a = store.add_assignment("laptops", 3600)
-    store.set_schedule(a.id, "track-x.timer", "systemd-timer", "then")
-    a = store.get_assignment(a.id)
-    assert a is not None
+def test_a_failed_post_warns_but_the_findings_are_still_kept(
+    store: Store, monkeypatch
+) -> None:
+    from track.errors import ReportError
+
+    a = store.add_assignment("a laptop", 3600)
     store.upsert_source(a.id, "eBay")
+    _fake_scouts(monkeypatch, [_sf("t", 10.0)])
+    monkeypatch.setattr(
+        "track.engine.post_summary", _raiser(ReportError("hotline-say exited 1"))
+    )
+    warnings: list[str] = []
 
-    monkeypatch.setattr("track.engine.scouts.run_scouts", lambda text, sources, **kw: [])
-    monkeypatch.setattr("track.engine.post_summary", lambda summary, **kw: None)
+    findings, _summary = run_assignment(store, a, post=True, warn=warnings.append)
 
-    def fail_schedule(*args, **kwargs):
-        raise AssertionError("systemd-timer assignments should not re-arm")
+    assert len(findings) == 1
+    assert any("could not post summary" in w for w in warnings)
 
-    monkeypatch.setattr("track.engine.scheduler.schedule", fail_schedule)
-    run_assignment(store, a, post=True)
+
+def test_a_wake_backed_assignment_rearms_itself(store: Store, monkeypatch) -> None:
+    from track.scheduler import ScheduleResult
+
+    a = store.add_assignment("a laptop", 3600, wake_backend="rtcwake")
+    store.set_schedule(a.id, "job-1", "wake", "2026-01-01T00:00:00+00:00")
+    store.upsert_source(a.id, "eBay")
+    _fake_scouts(monkeypatch, [])
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "track.engine.scheduler.schedule",
+        lambda *args, **kw: calls.append(kw)
+        or ScheduleResult("job-2", "wake", "2026-01-01T01:00:00+00:00", "job-2-resume"),
+    )
+
+    run_assignment(store, store.get_assignment(a.id) or a)
+
+    assert calls[0]["wake_backend"] == "rtcwake"
+    refreshed = store.get_assignment(a.id)
+    assert refreshed is not None
+    assert (refreshed.job_id, refreshed.resume_job_id) == ("job-2", "job-2-resume")
+
+
+def test_a_systemd_backed_assignment_does_not_rearm(store: Store, monkeypatch) -> None:
+    """The timer already recurs; re-arming it would be a second schedule."""
+    a = store.add_assignment("a laptop", 3600)
+    store.set_schedule(a.id, "track-a1.timer", "systemd-timer", "2026-01-01T00:00:00+00:00")
+    store.upsert_source(a.id, "eBay")
+    _fake_scouts(monkeypatch, [])
+
+    run_assignment(store, store.get_assignment(a.id) or a)  # scheduler.schedule would raise
+
+
+def test_a_paused_assignment_does_not_rearm(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    store.set_schedule(a.id, "job-1", "wake", "2026-01-01T00:00:00+00:00")
+    store.set_status(a.id, "paused")
+    store.upsert_source(a.id, "eBay")
+    _fake_scouts(monkeypatch, [])
+
+    run_assignment(store, store.get_assignment(a.id) or a)
+
+
+def _raiser(exc: Exception):
+    def boom(*a, **k):
+        raise exc
+
+    return boom

@@ -1,152 +1,345 @@
+"""CLI tests: exit codes, stdout/stderr discipline, and argument plumbing."""
+
 from __future__ import annotations
 
-import sys
+import json
 from pathlib import Path
 
-from track.cli import _run_command, main
+import pytest
+
+from track.cli import main
 from track.scheduler import ScheduleResult
+from track.store import Store
 
 
-def test_run_command_falls_back_to_argv0_when_track_not_on_path(monkeypatch) -> None:
-    monkeypatch.setattr("track.cli.shutil.which", lambda _b: None)
-    monkeypatch.setattr(sys, "argv", ["/home/bodas/data/track/.venv/bin/track", "add", "x"])
-    cmd = _run_command(["run", "abc123"])
-    assert cmd == ["/home/bodas/data/track/.venv/bin/track", "run", "abc123"]
+@pytest.fixture
+def db(tmp_path: Path) -> Path:
+    return tmp_path / "track.db"
 
 
-def test_run_command_prefers_path_lookup(monkeypatch) -> None:
-    monkeypatch.setattr("track.cli.shutil.which", lambda _b: "/usr/local/bin/track")
-    cmd = _run_command(["run", "abc123"])
-    assert cmd[0] == "/usr/local/bin/track"
+@pytest.fixture(autouse=True)
+def no_side_effects(monkeypatch):
+    """Nothing in this module may schedule, scout, or post."""
+    monkeypatch.setattr(
+        "track.cli.schedule_wakeup",
+        lambda *a, **k: ScheduleResult("job-1", "wake", "2026-01-01T00:00:00+00:00"),
+    )
+    monkeypatch.setattr("track.cli.cancel_schedule", lambda *a, **k: None)
+    monkeypatch.delenv("TRACK_HOTLINE_AGENT", raising=False)
+    monkeypatch.delenv("TRACK_HOTLINE_CHANNEL", raising=False)
 
 
-def test_version(capsys) -> None:
-    try:
-        main(["--version"])
-    except SystemExit:
-        pass
-    out = capsys.readouterr().out
-    assert "track" in out
+def _add(db: Path, *extra: str) -> str:
+    import contextlib
+    import io
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert main(["--db", str(db), "add", "a laptop", *extra]) == 0
+    return out.getvalue().strip()
 
 
-def test_usage_error_exit_code(capsys) -> None:
-    code = main([])
-    assert code == 2
+# -- usage ---------------------------------------------------------------
+
+
+def test_no_subcommand_is_a_usage_error(capsys) -> None:
+    assert main([]) == 2
     assert "error" in capsys.readouterr().err
 
 
-def test_invalid_interval_exit_code(tmp_path: Path, monkeypatch, capsys) -> None:
-    monkeypatch.setattr(
-        "track.cli.schedule_wakeup",
-        lambda *a, **k: ScheduleResult(job_id="j", backend="wake", next_run_at="t"),
-    )
-    code = main(["--db", str(tmp_path / "t.db"), "add", "x", "--interval", "notanumber"])
-    assert code == 2
+def test_bad_interval_is_a_usage_error(capsys, db: Path) -> None:
+    assert main(["--db", str(db), "add", "x", "--interval", "soon"]) == 2
     assert "invalid --interval" in capsys.readouterr().err
 
 
-def test_add_prints_id_and_schedules(tmp_path: Path, monkeypatch, capsys) -> None:
-    calls = []
-
-    def fake_schedule(assignment_id, interval_seconds, cmd, **kw):
-        calls.append((assignment_id, interval_seconds))
-        return ScheduleResult(job_id="job-1", backend="wake", next_run_at="soon")
-
-    monkeypatch.setattr("track.cli.schedule_wakeup", fake_schedule)
-    code = main(["--db", str(tmp_path / "t.db"), "add", "a cheap laptop", "--interval", "1h"])
-    assert code == 0
-    out = capsys.readouterr().out.strip()
-    assert len(out) == 8  # assignment id
-    assert calls[0][1] == 3600
+def test_zero_interval_is_rejected(db: Path) -> None:
+    assert main(["--db", str(db), "add", "x", "--interval", "0h"]) == 2
 
 
-def test_add_no_schedule_skips_scheduling(tmp_path: Path, monkeypatch) -> None:
-    def fail_schedule(*a, **k):
-        raise AssertionError("should not schedule")
-
-    monkeypatch.setattr("track.cli.schedule_wakeup", fail_schedule)
-    code = main(["--db", str(tmp_path / "t.db"), "add", "x", "--no-schedule"])
-    assert code == 0
+def test_wol_without_a_target_is_a_usage_error(capsys, db: Path) -> None:
+    rc = main(["--db", str(db), "add", "x", "--wake-backend", "wol"])
+    assert rc == 2
+    assert "--wake-target" in capsys.readouterr().err
 
 
-def test_add_schedule_failure_still_succeeds(tmp_path: Path, monkeypatch, capsys) -> None:
-    from track.errors import SchedulerError
-
-    def fail_schedule(*a, **k):
-        raise SchedulerError("wake not ready")
-
-    monkeypatch.setattr("track.cli.schedule_wakeup", fail_schedule)
-    code = main(["--db", str(tmp_path / "t.db"), "add", "x"])
-    assert code == 0
-    assert "wake not ready" in capsys.readouterr().err
-
-
-def test_list_empty(tmp_path: Path, capsys) -> None:
-    code = main(["--db", str(tmp_path / "t.db"), "list"])
-    assert code == 0
-
-
-def test_list_shows_assignments(tmp_path: Path, capsys) -> None:
-    db = tmp_path / "t.db"
-    main(["--db", str(db), "add", "laptops", "--no-schedule"])
-    code = main(["--db", str(db), "list"])
-    assert code == 0
-    assert "laptops" in capsys.readouterr().out
-
-
-def test_show_missing_assignment(tmp_path: Path, capsys) -> None:
-    code = main(["--db", str(tmp_path / "t.db"), "show", "nope"])
-    assert code == 1
+def test_unknown_assignment_is_a_failure_not_a_usage_error(capsys, db: Path) -> None:
+    assert main(["--db", str(db), "show", "nope"]) == 1
     assert "no such assignment" in capsys.readouterr().err
 
 
-def test_run_missing_assignment(tmp_path: Path, capsys) -> None:
-    code = main(["--db", str(tmp_path / "t.db"), "run", "nope"])
-    assert code == 1
+# -- add -----------------------------------------------------------------
 
 
-def test_run_invokes_engine(tmp_path: Path, monkeypatch, capsys) -> None:
-    db = tmp_path / "t.db"
-    main(["--db", str(db), "add", "laptops", "--no-schedule"])
-    assignment_id = capsys.readouterr().out.strip()
+def test_add_prints_only_the_id_on_stdout(capsys, db: Path) -> None:
+    assert main(["--db", str(db), "add", "a laptop"]) == 0
+    captured = capsys.readouterr()
 
-    monkeypatch.setattr("track.cli.run_assignment", lambda store, a, **kw: ([], "summary text"))
-    code = main(["--db", str(db), "run", assignment_id])
-    assert code == 0
-    assert "summary text" in capsys.readouterr().out
+    assert len(captured.out.strip()) == 8
+    assert "tracking" in captured.err  # progress goes to stderr
 
 
-def test_remove_cancels_schedule_and_deletes(tmp_path: Path, monkeypatch, capsys) -> None:
-    db = tmp_path / "t.db"
+def test_add_stores_the_options(db: Path) -> None:
+    assignment_id = _add(
+        db, "--interval", "2h", "--max-price", "400", "--notify", "track-dev",
+        "--wake-backend", "wol", "--wake-target", "aa:bb:cc:dd:ee:ff",
+        "--wake-on", "archserver",
+    )
+    with Store(db) as store:
+        a = store.get_assignment(assignment_id)
+
+    assert a is not None
+    assert a.interval_seconds == 7200
+    assert a.max_price == 400.0
+    assert a.notify_agent == "track-dev"
+    assert (a.wake_backend, a.wake_target) == ("wol", "aa:bb:cc:dd:ee:ff")
+    assert a.wake_on == "archserver"
+
+
+def test_wake_options_reach_the_scheduler(db: Path, monkeypatch) -> None:
+    seen: dict = {}
     monkeypatch.setattr(
         "track.cli.schedule_wakeup",
-        lambda *a, **k: ScheduleResult(job_id="job-1", backend="wake", next_run_at="soon"),
+        lambda *a, **kw: seen.update(kw)
+        or ScheduleResult("job-1", "wake", "2026-01-01T00:00:00+00:00"),
     )
-    main(["--db", str(db), "add", "laptops"])
-    assignment_id = capsys.readouterr().out.strip()
+    _add(db, "--wake-backend", "wol", "--wake-target", "aa:bb", "--wake-on", "archserver",
+         "--notify", "x")
 
-    cancelled = []
-    monkeypatch.setattr("track.cli.cancel_schedule", lambda job_id, backend: cancelled.append((job_id, backend)))
-    code = main(["--db", str(db), "remove", assignment_id])
-    assert code == 0
-    assert cancelled == [("job-1", "wake")]
-    assert main(["--db", str(db), "show", assignment_id]) == 1
+    assert seen["wake_backend"] == "wol"
+    assert seen["target"] == "aa:bb"
+    assert seen["run_on"] == "archserver"
 
 
-def test_pause_then_resume(tmp_path: Path, monkeypatch, capsys) -> None:
-    db = tmp_path / "t.db"
+@pytest.mark.parametrize(
+    ("text", "seconds"), [("90s", 90), ("30m", 1800), ("6h", 21600), ("2d", 172800), ("45", 45)]
+)
+def test_interval_units(db: Path, text: str, seconds: int) -> None:
+    assignment_id = _add(db, "--interval", text)
+    with Store(db) as store:
+        a = store.get_assignment(assignment_id)
+    assert a is not None and a.interval_seconds == seconds
+
+
+def test_scheduling_a_run_with_no_notify_target_warns(capsys, db: Path) -> None:
+    """That run would find things and have nowhere to report them."""
+    main(["--db", str(db), "add", "a laptop"])
+    assert "no --notify agent" in capsys.readouterr().err
+
+
+def test_no_schedule_skips_both_the_warning_and_the_scheduler(capsys, db: Path, monkeypatch) -> None:
+    monkeypatch.setattr("track.cli.schedule_wakeup", _boom)
+    assert main(["--db", str(db), "add", "a laptop", "--no-schedule"]) == 0
+    assert "no --notify agent" not in capsys.readouterr().err
+
+
+def test_a_scheduler_failure_does_not_lose_the_assignment(capsys, db: Path, monkeypatch) -> None:
+    from track.errors import SchedulerError
+
+    monkeypatch.setattr("track.cli.schedule_wakeup", _raiser(SchedulerError("wake add failed")))
+    rc = main(["--db", str(db), "add", "a laptop", "--notify", "x"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "could not schedule" in captured.err
+    assert len(captured.out.strip()) == 8
+
+
+# -- list / show / sources -----------------------------------------------
+
+
+def test_list_is_empty_on_stdout_when_there_is_nothing(capsys, db: Path) -> None:
+    assert main(["--db", str(db), "list"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no assignments" in captured.err
+
+
+def test_list_prints_one_row_per_assignment(capsys, db: Path) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    capsys.readouterr()
+    main(["--db", str(db), "list"])
+
+    out = capsys.readouterr().out
+    assert assignment_id in out
+    assert "a laptop" in out
+    assert "active" in out
+
+
+def test_list_json_is_parseable(capsys, db: Path) -> None:
+    _add(db, "--notify", "x")
+    capsys.readouterr()
+    main(["--db", str(db), "list", "--json"])
+
+    rows = json.loads(capsys.readouterr().out)
+    assert rows[0]["text"] == "a laptop"
+
+
+def test_show_reports_schedule_sources_and_spend(capsys, db: Path) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    with Store(db) as store:
+        store.upsert_source(assignment_id, "eBay", "https://ebay.com")
+        run_id = store.start_run(assignment_id)
+        store.add_finding(
+            assignment_id, run_id, "eBay", "ThinkPad", 300.0, "USD",
+            "https://ebay.com/1", "k1", 0.9, True,
+        )
+        store.finish_run(run_id, 1, 1, 0.2)
+    capsys.readouterr()
+
+    main(["--db", str(db), "show", assignment_id])
+    out = capsys.readouterr().out
+
+    assert "eBay" in out
+    assert "ThinkPad" in out
+    assert "300.00 USD" in out
+    assert "$0.200 spent" in out
+
+
+def test_sources_reports_statistics(capsys, db: Path) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    with Store(db) as store:
+        run_id = store.start_run(assignment_id)
+        for key, price in [("k1", 100.0), ("k2", 300.0), ("k3", None)]:
+            store.add_finding(
+                assignment_id, run_id, "eBay", f"t{key}", price, "USD", None, key, 0.5, True
+            )
+    capsys.readouterr()
+
+    main(["--db", str(db), "sources", assignment_id])
+    out = capsys.readouterr().out
+
+    assert "eBay: 3 listings, 2 priced (67%)" in out
+    assert "from 100.00 USD" in out
+    assert "median 200.00 USD" in out
+
+
+def test_sources_with_no_findings_says_so_on_stderr(capsys, db: Path) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    capsys.readouterr()
+    assert main(["--db", str(db), "sources", assignment_id]) == 0
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "run the assignment first" in captured.err
+
+
+def test_sources_json_is_parseable(capsys, db: Path) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    with Store(db) as store:
+        run_id = store.start_run(assignment_id)
+        store.add_finding(
+            assignment_id, run_id, "eBay", "t", 100.0, "USD", None, "k1", 0.5, True
+        )
+    capsys.readouterr()
+
+    main(["--db", str(db), "sources", assignment_id, "--json"])
+    assert json.loads(capsys.readouterr().out)[0]["cheapest"] == 100.0
+
+
+# -- run -----------------------------------------------------------------
+
+
+def test_run_prints_the_summary_to_stdout(capsys, db: Path, monkeypatch) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    monkeypatch.setattr("track.cli.run_assignment", lambda *a, **k: ([], "SUMMARY"))
+    capsys.readouterr()
+
+    assert main(["--db", str(db), "run", assignment_id, "--no-post"]) == 0
+    assert capsys.readouterr().out.strip() == "SUMMARY"
+
+
+def test_run_passes_the_no_post_flag_through(db: Path, monkeypatch) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    seen: dict = {}
     monkeypatch.setattr(
-        "track.cli.schedule_wakeup",
-        lambda *a, **k: ScheduleResult(job_id="job-1", backend="wake", next_run_at="soon"),
+        "track.cli.run_assignment",
+        lambda store, a, warn=None, post=True: seen.update(post=post) or ([], ""),
     )
-    main(["--db", str(db), "add", "laptops"])
-    assignment_id = capsys.readouterr().out.strip()
 
-    monkeypatch.setattr("track.cli.cancel_schedule", lambda job_id, backend: None)
-    code = main(["--db", str(db), "pause", assignment_id])
-    assert code == 0
-    assert "paused" in capsys.readouterr().err
+    main(["--db", str(db), "run", assignment_id, "--no-post"])
+    assert seen["post"] is False
+    main(["--db", str(db), "run", assignment_id])
+    assert seen["post"] is True
 
-    code = main(["--db", str(db), "resume", assignment_id])
-    assert code == 0
-    assert "resumed" in capsys.readouterr().err
+
+def test_a_paused_assignment_is_not_run_by_accident(capsys, db: Path, monkeypatch) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    main(["--db", str(db), "pause", assignment_id])
+    monkeypatch.setattr("track.cli.run_assignment", _boom)
+    capsys.readouterr()
+
+    assert main(["--db", str(db), "run", assignment_id]) == 1
+    assert "is paused" in capsys.readouterr().err
+
+
+def test_force_runs_a_paused_assignment(db: Path, monkeypatch) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    main(["--db", str(db), "pause", assignment_id])
+    monkeypatch.setattr("track.cli.run_assignment", lambda *a, **k: ([], "ok"))
+
+    assert main(["--db", str(db), "run", assignment_id, "--force"]) == 0
+
+
+# -- lifecycle -----------------------------------------------------------
+
+
+def test_pause_cancels_the_schedule_and_keeps_the_history(db: Path, monkeypatch) -> None:
+    cancelled: list[tuple] = []
+    monkeypatch.setattr(
+        "track.cli.cancel_schedule",
+        lambda job, backend, **kw: cancelled.append((job, backend, kw.get("resume_job_id"))),
+    )
+    assignment_id = _add(db, "--notify", "x")
+
+    assert main(["--db", str(db), "pause", assignment_id]) == 0
+    with Store(db) as store:
+        a = store.get_assignment(assignment_id)
+
+    assert cancelled == [("job-1", "wake", None)]
+    assert a is not None
+    assert a.status == "paused"
+    assert a.job_id is None
+
+
+def test_resume_reschedules(db: Path) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    main(["--db", str(db), "pause", assignment_id])
+
+    assert main(["--db", str(db), "resume", assignment_id]) == 0
+    with Store(db) as store:
+        a = store.get_assignment(assignment_id)
+
+    assert a is not None
+    assert a.status == "active"
+    assert a.job_id == "job-1"
+
+
+def test_remove_cancels_and_deletes(db: Path) -> None:
+    assignment_id = _add(db, "--notify", "x")
+
+    assert main(["--db", str(db), "remove", assignment_id]) == 0
+    with Store(db) as store:
+        assert store.get_assignment(assignment_id) is None
+
+
+def test_removing_an_unknown_assignment_fails(db: Path) -> None:
+    assert main(["--db", str(db), "remove", "nope"]) == 1
+
+
+def test_quiet_silences_stderr_but_not_stdout(capsys, db: Path) -> None:
+    assert main(["--db", str(db), "-q", "add", "a laptop", "--no-schedule"]) == 0
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert len(captured.out.strip()) == 8
+
+
+def _boom(*a, **k):
+    raise AssertionError("should not have been called")
+
+
+def _raiser(exc: Exception):
+    def boom(*a, **k):
+        raise exc
+
+    return boom

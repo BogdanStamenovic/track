@@ -1,19 +1,31 @@
 """Wakeup scheduling for track.
 
-Primary path shells out to the sibling `wake` CLI. `wake` tasks are
-one-shot: `wake add --at <epoch-seconds> --task <cmd> --backend shell`
-fires once and is done -- there is no recurring syntax. Recurrence is
-track's job, not wake's: each `track run` invocation that used the wake
-backend re-arms its own successor with a fresh `wake add` right before it
-finishes (see engine.run_assignment). This matches wake's own contract:
-it fires once at a time and callers own their repeat policy.
+The primary path shells out to the sibling `wake` CLI. `wake` tasks are
+one-shot -- there is no recurring syntax -- so recurrence is track's job:
+every `track run` that used the wake backend re-arms its own successor right
+before it finishes (see engine.run_assignment). Re-arming reuses a fixed task
+id (`track-<assignment>`), which makes it idempotent: an interrupted run that
+already armed its successor cannot leave two timers racing on the next one.
 
-If `wake` isn't on PATH (true as of writing -- it's still being scaffolded
-by a sibling agent), falls back to a systemd --user timer, which recurs on
-its own via OnUnitActiveSec and needs no re-arming.
+Waking a *sleeping* machine takes two tasks, not one. `rtcwake` and
+Wake-on-LAN only bring a box back to life; neither runs anything once it is
+up, and `wake serve` cannot fire a shell task on a machine that is suspended.
+So an assignment with a resume backend schedules a pair: the resume task at
+T, and the shell task that actually runs track at T + RESUME_GRACE_SECONDS,
+by which time the machine is up to receive it.
 
-`_invoke_wake_add` / `_invoke_wake_cancel` are the only places that know
-wake's CLI shape -- when its contract changes, only these need to change.
+Which machine runs the task matters once a resume backend is involved.
+`wake` fires shell tasks on the server unless the task names an owner, so a
+Wake-on-LAN assignment left unowned would wake the target box and then run
+track on the server instead of on it. `run_on` passes wake's `--on <host>`
+for the run task to close that.
+
+If `wake` isn't on PATH, this falls back to a `systemd --user` timer, which
+recurs on its own and needs no re-arming -- but only helps a box that is
+already running. That is the honest limit of the fallback, not a bug in it.
+
+`_invoke_wake_*` are the only places that know wake's CLI shape; when its
+contract changes, only they need to.
 """
 
 from __future__ import annotations
@@ -30,6 +42,13 @@ from .errors import SchedulerError
 
 WAKE_BIN = "wake"
 
+# How long after the resume task fires before the run task does. A cold
+# resume from suspend plus network coming back is comfortably inside this;
+# the cost of it being generous is only that the run starts late.
+RESUME_GRACE_SECONDS = 120
+
+RESUME_BACKENDS = ("rtcwake", "wol")
+
 
 class Runner(Protocol):
     def __call__(self, cmd: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]: ...
@@ -44,6 +63,7 @@ class ScheduleResult:
     job_id: str
     backend: str  # "wake" | "systemd-timer"
     next_run_at: str  # ISO8601, best-effort
+    resume_job_id: str | None = None
 
 
 def _isoformat(epoch_seconds: int) -> str:
@@ -52,25 +72,24 @@ def _isoformat(epoch_seconds: int) -> str:
 
 def _invoke_wake_add(
     run_at_epoch: int,
-    run_cmd: list[str],
+    task: str,
     *,
     backend: str,
     target: str | None,
+    task_id: str | None,
     runner: Runner,
     timeout: int,
+    run_on: str | None = None,
 ) -> str:
-    cmd = [
-        WAKE_BIN,
-        "add",
-        "--at",
-        str(run_at_epoch),
-        "--task",
-        " ".join(run_cmd),
-        "--backend",
-        backend,
-    ]
+    # --at is always epoch seconds, never a relative offset: wake rejects a
+    # bare "+5" outright and used to read it as 1970, firing immediately.
+    cmd = [WAKE_BIN, "add", "--at", str(run_at_epoch), "--task", task, "--backend", backend]
     if target:
         cmd += ["--target", target]
+    if task_id:
+        cmd += ["--id", task_id]
+    if run_on:
+        cmd += ["--on", run_on]
     try:
         result = runner(cmd, timeout=timeout)
     except FileNotFoundError as exc:
@@ -79,10 +98,10 @@ def _invoke_wake_add(
         raise SchedulerError(f"wake add timed out after {timeout}s") from exc
     if result.returncode != 0:
         raise SchedulerError(f"wake add failed: {result.stderr.strip()[:500]}")
-    task_id = result.stdout.strip()
-    if not task_id:
+    returned_id = result.stdout.strip()
+    if not returned_id:
         raise SchedulerError("wake add returned no task id")
-    return task_id
+    return returned_id
 
 
 def _invoke_wake_cancel(task_id: str, *, runner: Runner, timeout: int) -> None:
@@ -154,36 +173,96 @@ def _cancel_systemd_timer(job_id: str) -> None:
     )
 
 
+def task_id_for(assignment_id: str) -> str:
+    return f"track-{assignment_id}"
+
+
+def resume_task_id_for(assignment_id: str) -> str:
+    return f"track-{assignment_id}-resume"
+
+
 def schedule(
     assignment_id: str,
     interval_seconds: int,
     run_cmd: list[str],
     *,
-    backend: str = "shell",
+    wake_backend: str = "shell",
     target: str | None = None,
+    run_on: str | None = None,
     runner: Runner = _default_runner,
     timeout: int = 30,
     wake_available: bool | None = None,
     now: float | None = None,
 ) -> ScheduleResult:
     """Arm the next wakeup for an assignment, `interval_seconds` from now."""
+    if wake_backend not in ("shell", *RESUME_BACKENDS):
+        raise SchedulerError(f"unknown wake backend: {wake_backend!r}")
+    if wake_backend == "wol" and not target:
+        raise SchedulerError("the wol backend needs --wake-target <MAC address>")
+
     if wake_available is None:
         wake_available = shutil.which(WAKE_BIN) is not None
-    run_at = int((now if now is not None else time.time()) + interval_seconds)
-    if wake_available:
-        job_id = _invoke_wake_add(
-            run_at, run_cmd, backend=backend, target=target, runner=runner, timeout=timeout
+    base = now if now is not None else time.time()
+
+    if not wake_available:
+        if wake_backend in RESUME_BACKENDS:
+            raise SchedulerError(
+                f"the {wake_backend} backend needs the `wake` CLI on PATH "
+                "(a systemd timer cannot wake a sleeping machine)"
+            )
+        job_id = _schedule_systemd_timer(assignment_id, interval_seconds, run_cmd)
+        return ScheduleResult(
+            job_id=job_id,
+            backend="systemd-timer",
+            next_run_at=_isoformat(int(base + interval_seconds)),
         )
-        return ScheduleResult(job_id=job_id, backend="wake", next_run_at=_isoformat(run_at))
-    job_id = _schedule_systemd_timer(assignment_id, interval_seconds, run_cmd)
-    return ScheduleResult(job_id=job_id, backend="systemd-timer", next_run_at=_isoformat(run_at))
+
+    resume_at = int(base + interval_seconds)
+    resume_job_id: str | None = None
+    if wake_backend in RESUME_BACKENDS:
+        resume_job_id = _invoke_wake_add(
+            resume_at,
+            wake_backend,
+            backend=wake_backend,
+            target=target,
+            task_id=resume_task_id_for(assignment_id),
+            runner=runner,
+            timeout=timeout,
+        )
+        run_at = resume_at + RESUME_GRACE_SECONDS
+    else:
+        run_at = resume_at
+
+    job_id = _invoke_wake_add(
+        run_at,
+        " ".join(run_cmd),
+        backend="shell",
+        target=None,
+        task_id=task_id_for(assignment_id),
+        runner=runner,
+        timeout=timeout,
+        run_on=run_on,
+    )
+    return ScheduleResult(
+        job_id=job_id,
+        backend="wake",
+        next_run_at=_isoformat(run_at),
+        resume_job_id=resume_job_id,
+    )
 
 
 def cancel(
-    job_id: str, backend: str, *, runner: Runner = _default_runner, timeout: int = 30
+    job_id: str,
+    backend: str,
+    *,
+    resume_job_id: str | None = None,
+    runner: Runner = _default_runner,
+    timeout: int = 30,
 ) -> None:
     if backend == "wake":
         _invoke_wake_cancel(job_id, runner=runner, timeout=timeout)
+        if resume_job_id:
+            _invoke_wake_cancel(resume_job_id, runner=runner, timeout=timeout)
     elif backend == "systemd-timer":
         _cancel_systemd_timer(job_id)
     else:
