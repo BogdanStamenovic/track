@@ -91,7 +91,12 @@ def test_scout_has_a_spend_ceiling_and_asks_for_sonnet() -> None:
     cmd = seen["cmd"]
 
     assert cmd[cmd.index("--model") + 1] == "sonnet"
-    assert float(cmd[cmd.index("--max-budget-usd") + 1]) > 0
+
+    # An upper bound, not just "> 0". This is an unattended job on a timer
+    # that re-arms itself, so the ceiling is the only thing between a runaway
+    # scout and a bill; "some positive number" is satisfied by 999.
+    budget = float(cmd[cmd.index("--max-budget-usd") + 1])
+    assert 0 < budget <= 1.0, f"a scout's ceiling must stay small, got {budget}"
 
 
 def test_prompt_countermands_the_inherited_improvise_directive() -> None:

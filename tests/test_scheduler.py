@@ -111,8 +111,14 @@ def test_the_run_task_fires_after_the_machine_has_had_time_to_come_up() -> None:
     )
     resume_at = int(_flag(calls[0], "--at"))
     run_at = int(_flag(calls[1], "--at"))
+    gap = run_at - resume_at
 
-    assert run_at - resume_at == RESUME_GRACE_SECONDS
+    # Pinned against a real duration, not against the constant: comparing to
+    # RESUME_GRACE_SECONDS passes just as happily when it is zero, and a zero
+    # grace runs the check at the instant the resume is requested, before the
+    # machine has begun coming up.
+    assert gap >= 60, f"a resumed box needs time to come up, got {gap}s"
+    assert gap == RESUME_GRACE_SECONDS
 
 
 def test_wol_passes_the_mac_through_as_the_target() -> None:
@@ -285,7 +291,10 @@ def test_a_zero_interval_cannot_schedule_a_run_in_the_past() -> None:
     calls, runner = _recording()
     schedule("a1", 0, ["track", "run", "a1"], runner=runner, wake_available=True, now=NOW)
 
-    assert int(_flag(calls[0], "--at")) == int(NOW) + MIN_LEAD_SECONDS
+    at = int(_flag(calls[0], "--at"))
+
+    assert at >= int(NOW) + 30, "a floor of zero is not a floor"
+    assert at == int(NOW) + MIN_LEAD_SECONDS
 
 
 def test_a_negative_interval_is_floored_too() -> None:

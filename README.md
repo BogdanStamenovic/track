@@ -164,6 +164,21 @@ tried, both return `Not logged in`. So the countermand lives in the scout
 prompt instead. The tool restriction is what makes a workaround impossible;
 the prompt is what stops the scout wasting its budget attempting one.
 
+## Testing
+
+`.venv/bin/python -m pytest` runs the suite. `scripts/mutate.sh` is a small
+mutation check that flips each tuning constant and reports whether the suite
+notices. It exists because four of them did not: assertions like
+`assert gap == RESUME_GRACE_SECONDS` pass just as happily when that constant
+is zero, so they pinned nothing. Those now assert the property that matters
+(a resumed machine needs *some* seconds to come up; a scout's budget ceiling
+must stay *small*) with the constant checked alongside it.
+
+Clear `__pycache__` before trusting a re-run after editing a single constant —
+same file size and same mtime second means Python will reuse the stale
+bytecode and report a result for code you are no longer running. That happened
+here, on source verified byte-identical to git.
+
 ## Limitations
 
 - **Research only.** It never places an order, messages a seller, or holds

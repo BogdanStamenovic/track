@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from track.engine import REDISCOVER_EVERY, ensure_sources, run_assignment, run_command
+from track.engine import (
+    DEFAULT_SOURCE_LIMIT,
+    REDISCOVER_EVERY,
+    ensure_sources,
+    run_assignment,
+    run_command,
+)
 from track.errors import ScoutError
 from track.scouts import ScoutFinding, ScoutResult
 from track.store import Store
@@ -379,3 +385,31 @@ def test_rearming_reproduces_the_same_command_it_was_scheduled_with(
     run_assignment(store, store.get_assignment(a.id) or a)
 
     assert seen[0] == run_command(store, a.id)
+
+
+# -- the tuning constants, pinned to what they are actually for ------------
+
+
+def test_a_run_fans_out_to_several_sources() -> None:
+    """One scout is not a survey; a silent drop to 1 halves the tool's value."""
+    assert DEFAULT_SOURCE_LIMIT >= 3
+
+
+def test_source_discovery_is_periodic_not_per_run() -> None:
+    """Rediscovering every run pays the discovery scout's cost every run."""
+    assert REDISCOVER_EVERY >= 5
+
+
+def test_only_the_source_limit_worth_of_scouts_is_launched(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    for i in range(DEFAULT_SOURCE_LIMIT + 3):
+        store.upsert_source(a.id, f"source-{i}")
+    seen: dict = {}
+    monkeypatch.setattr(
+        "track.engine.scouts.run_scouts",
+        lambda text, hints, **k: seen.update(hints=hints) or ScoutResult(),
+    )
+
+    run_assignment(store, a)
+
+    assert len(seen["hints"]) == DEFAULT_SOURCE_LIMIT
