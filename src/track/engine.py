@@ -21,6 +21,7 @@ from __future__ import annotations
 import shutil
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import scheduler, scouts
@@ -126,21 +127,46 @@ def _rearm_wake(
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class RunOutcome:
+    """What a single research pass did, in the terms an unattended caller needs.
+
+    A scheduled run has nobody watching stderr, so the caller's exit code is
+    the only signal that reaches anyone. It has to distinguish three things a
+    log line would otherwise blur: the research worked and found something,
+    the research honestly found nothing, and the report never got out at all.
+    """
+
+    findings: list[Finding]
+    summary: str
+    posted: bool
+    usable: int  # new findings that survived the price ceiling
+    scout_failures: int
+
+
 def run_assignment(
     store: Store,
     assignment: Assignment,
     *,
     warn: Callable[[str], None] = lambda _m: None,
     post: bool = True,
-) -> tuple[list[Finding], str]:
+) -> RunOutcome:
     source_names, discovery_cost = ensure_sources(store, assignment, warn=warn)
     run_id = store.start_run(assignment.id)
+
+    scout_failures = 0
+
+    def scout_warn(message: str) -> None:
+        nonlocal scout_failures
+        if "failed" in message:
+            scout_failures += 1
+        warn(message)
 
     scouted = scouts.run_scouts(
         assignment.text,
         source_names[:DEFAULT_SOURCE_LIMIT],
         market=assignment.market,
-        warn=warn,
+        warn=scout_warn,
     )
     if scouted.blocked:
         warn(
@@ -196,11 +222,30 @@ def run_assignment(
         stats=stats,
         cost_usd=cost,
         schedule_error=schedule_error,
+        scout_failures=scout_failures,
     )
+    posted = False
     if post:
         try:
             post_summary(summary, agent=assignment.notify_agent)
+            posted = True
         except TrackError as exc:
             warn(f"could not post summary: {exc}")
 
-    return stored, summary
+    usable = [
+        f
+        for f in stored
+        if f.is_new
+        and not (
+            assignment.max_price is not None
+            and f.price is not None
+            and f.price > assignment.max_price
+        )
+    ]
+    return RunOutcome(
+        findings=stored,
+        summary=summary,
+        posted=posted,
+        usable=len(usable),
+        scout_failures=scout_failures,
+    )

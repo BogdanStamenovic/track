@@ -7,8 +7,20 @@ systemd --user timer), spins up Sonnet scouts each run, and posts what it
 found to Discord via hotline-say.
 
 Keeps stdout clean for real output (assignment ids, listings, summaries);
-all progress and warnings go to stderr. Exit codes: 0 success, 1 one or
-more operations failed, 2 usage error.
+all progress and warnings go to stderr.
+
+Exit codes: 0 success, 1 one or more operations failed, 2 usage error.
+`track run` refines that, because it is the command a scheduler fires with
+nobody watching and its exit status is the only signal that reaches anyone:
+
+    0  a summary was posted and it contained at least one usable finding
+    1  a summary was posted, honestly, but there was nothing usable in it
+    2  usage error
+    3  the summary could not be posted at all
+
+Silence and success must not look alike at 08:00, so "ran but found nothing"
+is deliberately not 0, and a report that never reached Discord is its own
+code rather than being folded into a generic failure.
 """
 
 from __future__ import annotations
@@ -109,6 +121,13 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("assignment_id")
     run_p.add_argument("--no-post", action="store_true", help="do not post the summary to Discord")
     run_p.add_argument("--force", action="store_true", help="run even if the assignment is paused")
+
+    unschedule_p = sub.add_parser(
+        "unschedule",
+        help="cancel the recurring wakeup but keep the assignment active "
+        "(for when an external scheduler owns the timing)",
+    )
+    unschedule_p.add_argument("assignment_id")
 
     for name, help_text in [
         ("remove", "stop tracking an assignment and cancel its schedule"),
@@ -305,10 +324,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                         file=sys.stderr,
                     )
                     return 1
-                _findings, summary = run_assignment(
-                    store, assignment, warn=log, post=not args.no_post
-                )
-                print(summary)
+                outcome = run_assignment(store, assignment, warn=log, post=not args.no_post)
+                print(outcome.summary)
+                if args.no_post:
+                    return 0 if outcome.usable else 1
+                if not outcome.posted:
+                    print(
+                        "track: error: the summary could not be posted", file=sys.stderr
+                    )
+                    return 3
+                if not outcome.usable:
+                    log("track: nothing usable found this run (summary posted anyway)")
+                    return 1
+                return 0
+
+            if args.command == "unschedule":
+                assignment = _require(store, args.assignment_id)
+                _disarm(store, assignment, log)
+                log(f"unscheduled {assignment.id}; it stays active but will not self-run")
                 return 0
 
             if args.command == "remove":

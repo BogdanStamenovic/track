@@ -108,7 +108,8 @@ def test_a_run_stores_scores_and_summarises(store: Store, monkeypatch) -> None:
     store.upsert_source(a.id, "eBay")
     _fake_scouts(monkeypatch, [_sf("ThinkPad", 300.0)], cost=0.12)
 
-    findings, summary = run_assignment(store, a)
+    outcome = run_assignment(store, a)
+    findings, summary = outcome.findings, outcome.summary
 
     assert len(findings) == 1
     assert findings[0].is_new is True
@@ -125,7 +126,7 @@ def test_the_second_sighting_of_a_listing_is_not_new(store: Store, monkeypatch) 
     _fake_scouts(monkeypatch, [_sf("ThinkPad", 300.0)])
 
     run_assignment(store, a)
-    second, _summary = run_assignment(store, store.get_assignment(a.id) or a)
+    second = run_assignment(store, store.get_assignment(a.id) or a).findings
 
     assert second[0].is_new is False
 
@@ -143,7 +144,7 @@ def test_scores_do_not_depend_on_which_scout_returned_first(tmp_path, monkeypatc
             _fake_scouts(monkeypatch, [_sf("seed", 250.0)])
             run_assignment(s, assignment)
             _fake_scouts(monkeypatch, order)
-            found, _summary = run_assignment(s, s.get_assignment(assignment.id) or assignment)
+            found = run_assignment(s, s.get_assignment(assignment.id) or assignment).findings
             return {f.title: f.score for f in found}
 
     forwards = scores_for("fwd", batch)
@@ -164,7 +165,7 @@ def test_a_price_drop_is_scored_against_the_history_that_existed(
     run_assignment(store, a)
 
     _fake_scouts(monkeypatch, [_sf("bargain", 100.0)])
-    second, _summary = run_assignment(store, store.get_assignment(a.id) or a)
+    second = run_assignment(store, store.get_assignment(a.id) or a).findings
 
     assert second[0].score == 1.0
 
@@ -175,7 +176,7 @@ def test_an_earlier_finding_is_never_rescored(store: Store, monkeypatch) -> None
     store.upsert_source(a.id, "eBay")
 
     _fake_scouts(monkeypatch, [_sf("first", 500.0)])
-    (first,), _summary = run_assignment(store, a)
+    (first,) = run_assignment(store, a).findings
     original_score = first.score
 
     _fake_scouts(monkeypatch, [_sf("cheaper", 10.0)])
@@ -191,7 +192,7 @@ def test_an_unpriced_listing_is_stored_unscored_not_dropped(store: Store, monkey
     _fake_scouts(monkeypatch, [_sf("blocked", None)], blocked=1)
 
     warnings: list[str] = []
-    findings, _summary = run_assignment(store, a, warn=warnings.append)
+    findings = run_assignment(store, a, warn=warnings.append).findings
 
     assert findings[0].price is None
     assert findings[0].score is None
@@ -213,7 +214,8 @@ def test_no_sources_yields_an_honest_empty_run(store: Store, monkeypatch) -> Non
     _fake_discovery(monkeypatch, [])
     _fake_scouts(monkeypatch, [])
 
-    findings, summary = run_assignment(store, a)
+    outcome = run_assignment(store, a)
+    findings, summary = outcome.findings, outcome.summary
 
     assert findings == []
     assert "Nothing new this run." in summary
@@ -249,7 +251,7 @@ def test_a_failed_post_warns_but_the_findings_are_still_kept(
     )
     warnings: list[str] = []
 
-    findings, _summary = run_assignment(store, a, post=True, warn=warnings.append)
+    findings = run_assignment(store, a, post=True, warn=warnings.append).findings
 
     assert len(findings) == 1
     assert any("could not post summary" in w for w in warnings)
@@ -322,7 +324,7 @@ def test_a_failed_rearm_reaches_discord_not_just_stderr(store: Store, monkeypatc
     )
     warnings: list[str] = []
 
-    findings, _summary = run_assignment(store, a, warn=warnings.append)
+    findings = run_assignment(store, a, warn=warnings.append).findings
 
     assert "UNIQUE constraint failed" in posted[0]
     assert "will not run" in posted[0]
@@ -342,7 +344,7 @@ def test_a_healthy_rearm_leaves_no_warning_in_the_summary(store: Store, monkeypa
         lambda *a, **k: ScheduleResult("job-2", "wake", "2026-01-01T01:00:00+00:00"),
     )
 
-    _findings, summary = run_assignment(store, store.get_assignment(a.id) or a)
+    summary = run_assignment(store, store.get_assignment(a.id) or a).summary
     assert "will not run" not in summary
 
 
@@ -428,7 +430,7 @@ def test_a_finding_is_scored_only_against_its_own_currency(store: Store, monkeyp
     _fake_scouts(monkeypatch, [
         ScoutFinding("KP", "euro listing", 40.0, "EUR", "https://kp/3"),
     ])
-    found, _summary = run_assignment(store, store.get_assignment(a.id) or a)
+    found = run_assignment(store, store.get_assignment(a.id) or a).findings
 
     # 40 is a smaller number than every RSD price on record; if the currencies
     # were pooled it would score 1.0 for being "cheapest ever".

@@ -42,6 +42,7 @@ def build_summary(
     stats: list[SourceStat] | None = None,
     cost_usd: float = 0.0,
     schedule_error: str | None = None,
+    scout_failures: int = 0,
 ) -> str:
     """A tight Discord-shaped summary of one run."""
     over_ceiling = 0
@@ -64,7 +65,16 @@ def build_summary(
     lines = [header]
 
     if not new_findings:
-        lines.append("\nNothing new this run.")
+        # An empty run has two very different causes and the reader cannot
+        # tell them apart from "nothing new": the market was quiet, or the
+        # research did not happen. Say which.
+        if scout_failures:
+            lines.append(
+                f"\nNothing new this run — but {scout_failures} scout(s) failed, "
+                "so this is not evidence the market is quiet."
+            )
+        else:
+            lines.append("\nNothing new this run.")
     else:
         ranked = sorted(new_findings, key=lambda f: (f.score if f.score is not None else -1.0), reverse=True)
         lines.append("")
@@ -104,6 +114,8 @@ def build_summary(
         names = ", ".join(dict.fromkeys(s.name for s in unreadable))
         lines.append(f"  no price readable from: {names}")
 
+    if scout_failures and new_findings:
+        lines.append(f"\n_{scout_failures} scout(s) failed; this run saw less than usual._")
     if cost_usd:
         lines.append(f"\n_scouts: ${cost_usd:.3f}_")
     if schedule_error:

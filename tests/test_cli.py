@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from track.cli import main
+from track.engine import RunOutcome
 from track.scheduler import ScheduleResult
 from track.store import Store
 
@@ -241,7 +242,10 @@ def test_sources_json_is_parseable(capsys, db: Path) -> None:
 
 def test_run_prints_the_summary_to_stdout(capsys, db: Path, monkeypatch) -> None:
     assignment_id = _add(db, "--notify", "x")
-    monkeypatch.setattr("track.cli.run_assignment", lambda *a, **k: ([], "SUMMARY"))
+    monkeypatch.setattr(
+        "track.cli.run_assignment",
+        lambda *a, **k: RunOutcome([], "SUMMARY", posted=True, usable=1, scout_failures=0),
+    )
     capsys.readouterr()
 
     assert main(["--db", str(db), "run", assignment_id, "--no-post"]) == 0
@@ -253,7 +257,8 @@ def test_run_passes_the_no_post_flag_through(db: Path, monkeypatch) -> None:
     seen: dict = {}
     monkeypatch.setattr(
         "track.cli.run_assignment",
-        lambda store, a, warn=None, post=True: seen.update(post=post) or ([], ""),
+        lambda store, a, warn=None, post=True: seen.update(post=post)
+        or RunOutcome([], "", posted=True, usable=1, scout_failures=0),
     )
 
     main(["--db", str(db), "run", assignment_id, "--no-post"])
@@ -275,7 +280,10 @@ def test_a_paused_assignment_is_not_run_by_accident(capsys, db: Path, monkeypatc
 def test_force_runs_a_paused_assignment(db: Path, monkeypatch) -> None:
     assignment_id = _add(db, "--notify", "x")
     main(["--db", str(db), "pause", assignment_id])
-    monkeypatch.setattr("track.cli.run_assignment", lambda *a, **k: ([], "ok"))
+    monkeypatch.setattr(
+        "track.cli.run_assignment",
+        lambda *a, **k: RunOutcome([], "ok", posted=True, usable=1, scout_failures=0),
+    )
 
     assert main(["--db", str(db), "run", assignment_id, "--force"]) == 0
 
@@ -370,3 +378,80 @@ def test_adding_without_a_market_warns_that_results_will_be_foreign(
     main(["--db", str(db), "add", "a laptop", "--notify", "x"])
 
     assert "no --market set" in capsys.readouterr().err
+
+
+# -- exit codes, which are the only signal a 08:00 run can send ------------
+
+
+def _outcome(monkeypatch, **kw):
+    defaults = {"findings": [], "summary": "S", "posted": True, "usable": 1,
+                "scout_failures": 0}
+    defaults.update(kw)
+    monkeypatch.setattr("track.cli.run_assignment", lambda *a, **k: RunOutcome(**defaults))
+
+
+def test_run_exits_0_only_when_a_summary_was_posted_with_something_in_it(
+    db: Path, monkeypatch
+) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    _outcome(monkeypatch, posted=True, usable=2)
+
+    assert main(["--db", str(db), "run", assignment_id]) == 0
+
+
+def test_a_run_that_found_nothing_is_not_a_success(capsys, db: Path, monkeypatch) -> None:
+    """Silence and success must not look alike to whatever fired this."""
+    assignment_id = _add(db, "--notify", "x")
+    _outcome(monkeypatch, posted=True, usable=0)
+
+    assert main(["--db", str(db), "run", assignment_id]) == 1
+    assert "nothing usable" in capsys.readouterr().err
+
+
+def test_a_report_that_never_reached_discord_has_its_own_exit_code(
+    capsys, db: Path, monkeypatch
+) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    _outcome(monkeypatch, posted=False, usable=5)
+
+    assert main(["--db", str(db), "run", assignment_id]) == 3
+    assert "could not be posted" in capsys.readouterr().err
+
+
+def test_no_post_is_judged_on_findings_alone(db: Path, monkeypatch) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    _outcome(monkeypatch, posted=False, usable=1)
+    assert main(["--db", str(db), "run", assignment_id, "--no-post"]) == 0
+    _outcome(monkeypatch, posted=False, usable=0)
+    assert main(["--db", str(db), "run", assignment_id, "--no-post"]) == 1
+
+
+# -- unschedule -----------------------------------------------------------
+
+
+def test_unschedule_drops_the_timer_but_keeps_the_assignment_runnable(
+    db: Path, monkeypatch
+) -> None:
+    """For when an external scheduler owns the timing instead of track."""
+    cancelled: list = []
+    monkeypatch.setattr(
+        "track.cli.cancel_schedule", lambda job, backend, **kw: cancelled.append(job)
+    )
+    assignment_id = _add(db, "--notify", "x")
+
+    assert main(["--db", str(db), "unschedule", assignment_id]) == 0
+    with Store(db) as store:
+        a = store.get_assignment(assignment_id)
+
+    assert cancelled == ["job-1"]
+    assert a is not None
+    assert a.status == "active", "still runnable on demand"
+    assert a.job_id is None and a.backend is None
+
+
+def test_an_unscheduled_assignment_still_runs_without_force(db: Path, monkeypatch) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    main(["--db", str(db), "unschedule", assignment_id])
+    _outcome(monkeypatch)
+
+    assert main(["--db", str(db), "run", assignment_id]) == 0
