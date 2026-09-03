@@ -229,6 +229,33 @@ same file size and same mtime second means Python will reuse the stale
 bytecode and report a result for code you are no longer running. That happened
 here, on source verified byte-identical to git.
 
+## Running it unattended
+
+`track run` is designed to be fired by a scheduler on a machine with nobody
+logged in, which is why its exit codes are the way they are. Measured facts
+from deploying it that way, rather than assumptions:
+
+- **It needs nothing from the environment.** Verified under
+  `env -i HOME=... PATH=/usr/local/bin:/usr/bin`, cwd `/tmp`: exit 0, summary
+  posted. The database path, the market and the notify target all come from
+  the assignment row, and `hotline-say` is resolved by absolute fallback. A
+  systemd unit's environment is close to this bare.
+- **Runtime is 45–110s** for five parallel scouts. Allow at least 300s.
+- **The Claude access token is short-lived** (8 hours on a subscription) and
+  the CLI refreshes it headlessly, rotating the refresh token as it does.
+  Both were verified deliberately, by forcing `expiresAt` into the past: a
+  single `claude -p` refreshed cleanly, and so did a full run launching five
+  scouts *concurrently* against an already-expired token, with no failures.
+  That race is the one worth knowing about — five processes noticing an
+  expired token at the same instant is exactly what a scheduled run does.
+- **Test the refresh in place, never against a copy of the credentials.**
+  Refreshing rotates the refresh token, so a sandboxed copy that refreshes
+  successfully leaves the real credentials holding an invalidated one — it
+  would *cause* the outage it was meant to rule out.
+- **Reporting does not depend on the research credentials.** `hotline-say`
+  posts with its own Discord token, so a total scout failure still delivers an
+  honest report and exits 1 rather than going silent.
+
 ## Limitations
 
 - **Research only.** It never places an order, messages a seller, or holds
