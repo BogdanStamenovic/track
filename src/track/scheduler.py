@@ -135,6 +135,10 @@ def _invoke_wake_cancel(task_id: str, *, runner: Runner, timeout: int) -> None:
         raise SchedulerError(f"wake cancel failed: {result.stderr.strip()[:500]}")
 
 
+def _timer_stamp_path(timer_unit: str) -> Path:
+    return Path.home() / ".local" / "share" / "systemd" / "timers" / f"stamp-{timer_unit}"
+
+
 def _systemd_unit_paths(label: str) -> tuple[Path, Path]:
     unit_dir = Path.home() / ".config" / "systemd" / "user"
     return unit_dir / f"track-{label}.service", unit_dir / f"track-{label}.timer"
@@ -150,13 +154,19 @@ def _schedule_systemd_timer(label: str, interval_seconds: int, run_cmd: list[str
         "Type=oneshot\n"
         f"ExecStart={' '.join(run_cmd)}\n"
     )
+    # OnActiveSec=0s is what catches up a missed run: the timer fires as soon
+    # as it is activated, which includes every start of the user manager, so a
+    # box that was off through a scheduled check runs it on the way back up.
+    # Persistent= is NOT what does that and used to be set here -- systemd
+    # accepts it and even writes a stamp file, but its catch-up behaviour only
+    # applies to OnCalendar= timers, so on a monotonic one it is a line that
+    # reads like a guarantee and provides nothing.
     timer_path.write_text(
         "[Unit]\n"
         f"Description=track timer for {label}\n\n"
         "[Timer]\n"
         f"OnUnitActiveSec={interval_seconds}s\n"
-        "OnActiveSec=0s\n"
-        "Persistent=true\n\n"
+        "OnActiveSec=0s\n\n"
         "[Install]\n"
         "WantedBy=timers.target\n"
     )
@@ -199,6 +209,7 @@ def _cancel_systemd_timer(job_id: str) -> None:
     service_path, timer_path = _systemd_unit_paths(label)
     service_path.unlink(missing_ok=True)
     timer_path.unlink(missing_ok=True)
+    _timer_stamp_path(job_id).unlink(missing_ok=True)
     subprocess.run(
         ["systemctl", "--user", "daemon-reload"], capture_output=True, text=True, check=False
     )

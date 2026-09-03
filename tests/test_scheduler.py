@@ -158,7 +158,10 @@ def test_systemd_fallback_is_used_when_wake_is_missing(tmp_path, monkeypatch) ->
     assert result.backend == "systemd-timer"
     assert result.job_id == "track-a1.timer"
     unit = tmp_path / ".config" / "systemd" / "user" / "track-a1.timer"
-    assert "OnUnitActiveSec=3600s" in unit.read_text()
+    body = unit.read_text()
+    assert "OnUnitActiveSec=3600s" in body
+    assert "OnActiveSec=0s" in body, "this is what catches up a run missed while off"
+    assert "Persistent=" not in body, "only affects OnCalendar timers; misleading here"
 
 
 def test_systemd_fallback_refuses_a_resume_backend_it_cannot_honour() -> None:
@@ -309,3 +312,20 @@ def test_the_systemd_fallback_is_floored_as_well(tmp_path, monkeypatch) -> None:
 
     unit = (tmp_path / ".config" / "systemd" / "user" / "track-a1.timer").read_text()
     assert f"OnUnitActiveSec={MIN_LEAD_SECONDS}s" in unit
+
+
+def test_cancelling_a_timer_removes_its_persistence_stamp(tmp_path, monkeypatch) -> None:
+    """Systemd writes one per timer and never removes it with the unit."""
+    from track.scheduler import _cancel_systemd_timer
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "track.scheduler.subprocess.run", lambda *a, **k: completed("")
+    )
+    stamp = tmp_path / ".local" / "share" / "systemd" / "timers" / "stamp-track-a1.timer"
+    stamp.parent.mkdir(parents=True)
+    stamp.touch()
+
+    _cancel_systemd_timer("track-a1.timer")
+
+    assert not stamp.exists()

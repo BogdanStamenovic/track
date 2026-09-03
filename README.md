@@ -193,6 +193,11 @@ the prompt is what stops the scout wasting its budget attempting one.
 - **The systemd fallback is Linux-only and cannot wake a suspended box.**
   It refuses `--wake-backend rtcwake`/`wol` outright rather than pretending.
   Waking a sleeping machine needs `wake` installed.
+- **The systemd fallback catches up a missed run**, but through
+  `OnActiveSec=0s` — the timer fires as soon as it is activated, including at
+  every user-manager start — not through `Persistent=`, which only does that
+  for `OnCalendar=` timers and used to sit in the unit reading like a
+  guarantee it wasn't providing.
 - **No wakeup is ever scheduled less than 60s out.** Every run re-arms the
   next one, so a past-dated wakeup would not fire once — it would spin as
   fast as the scheduler polls.
