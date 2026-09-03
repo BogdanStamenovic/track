@@ -22,6 +22,34 @@ def test_discover_sources_parses_json_array() -> None:
     assert result == [{"source": "eBay", "url": "https://ebay.com", "notes": "cheap"}]
 
 
+def test_scout_invocation_restricts_tools_to_web_only() -> None:
+    seen_cmd = {}
+
+    def runner(cmd, *, input, timeout):
+        seen_cmd["cmd"] = cmd
+        return _completed("[]")
+
+    discover_sources("a laptop", runner=runner)
+    cmd = seen_cmd["cmd"]
+    assert "--allowedTools" in cmd
+    allowed = cmd[cmd.index("--allowedTools") + 1]
+    assert "Bash" not in allowed
+    assert "WebSearch" in allowed
+    assert "WebFetch" in allowed
+
+
+def test_scout_invocation_caps_spend() -> None:
+    seen_cmd = {}
+
+    def runner(cmd, *, input, timeout):
+        seen_cmd["cmd"] = cmd
+        return _completed("[]")
+
+    discover_sources("a laptop", runner=runner)
+    cmd = seen_cmd["cmd"]
+    assert "--max-budget-usd" in cmd
+
+
 def test_discover_sources_tolerates_prose_around_json() -> None:
     raw = 'Sure, here you go:\n[{"source": "eBay", "url": null, "notes": "x"}]\nHope that helps!'
 

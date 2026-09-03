@@ -73,7 +73,14 @@ falls back to a `systemd --user` timer, which recurs on its own.
   payment credentials -- by design, not as an unfinished feature.
 - Scout quality depends entirely on what the underlying Claude session can
   actually find on the open web; it has no special access to marketplace
-  APIs or private inventory feeds.
+  APIs or private inventory feeds. Scouts run with only `WebSearch` and
+  `WebFetch` (no shell, no proxies) and a hard `--max-budget-usd` /
+  tool-call ceiling, deliberately -- an early version, given full tool
+  access, responded to eBay's anti-bot 403s by spoofing headers and piping
+  requests through third-party proxies instead of reporting what it found.
+  Sites that block scraping (eBay confirmed) mean listings often come back
+  with `price: null` rather than a fetched exact price -- that's the honest
+  result of a read-only scout respecting the block, not a bug.
 - The `wake` integration is one choke point (`scheduler.py`) built against
   `wake`'s v1 CLI contract; if that contract changes, only that file needs
   to change.

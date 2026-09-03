@@ -19,8 +19,22 @@ from typing import Protocol
 from .errors import ScoutError
 
 DEFAULT_MODEL = "sonnet"
-DEFAULT_TIMEOUT = 300
+DEFAULT_TIMEOUT = 120
 DEFAULT_MAX_WORKERS = 4
+
+# `claude -p` auto-grants full tool access when there's no TTY to prompt --
+# including raw Bash. Without this, a scout that hits a 403 will happily
+# start spoofing headers and piping requests through third-party proxies to
+# get around it (observed live against eBay) instead of just reporting what
+# it found. Scouts get read-only web tools and nothing else.
+SCOUT_ALLOWED_TOOLS = "WebSearch,WebFetch"
+
+# Hard financial/wall-clock backstop. This isn't an interactive session
+# Bogdan is watching -- it's an unattended job on a timer, so unlike normal
+# usage it needs a real ceiling: a scout that starts refining queries in
+# search of an exact price match (observed live) will happily burn its full
+# timeout chasing one listing instead of returning what it already has.
+SCOUT_MAX_BUDGET_USD = "0.50"
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,8 +73,17 @@ Return at most 8 sources, ranked best first."""
 LISTING_SCOUT_TEMPLATE = """You are a bargain-hunting scout. Assignment: {assignment}
 
 Search {source_hint} right now for actual current listings that match. Do not
-buy or contact anyone. Respond with ONLY a JSON array, no prose, no markdown
-fences:
+buy or contact anyone. You have WebSearch and WebFetch only -- no shell, no
+proxies, no working around blocks. If a page 403s, is paywalled, or WebFetch
+otherwise can't load it, just use the title/price/snippet from the search
+result instead of trying another way in.
+
+Budget: at most 3 tool calls total, then stop and answer with whatever you
+have. Do not refine your query chasing an exact price for one specific
+listing -- an approximate price from a search snippet is fine, and price:
+null for a listing is fine too if no page will give it up. A handful of
+good-enough results beats one perfect one. Respond with ONLY a JSON array,
+no prose, no markdown fences:
 
 [{{"source": "<site or seller name>", "title": "<listing title>", "price": <number or null>, "currency": "<ISO code or null>", "url": "<listing url>"}}]
 
@@ -69,7 +92,16 @@ Only include listings you can see are genuinely live right now. Return at most
 
 
 def _run_claude(prompt: str, *, model: str, timeout: int, runner: Runner) -> str:
-    cmd = ["claude", "-p", "--model", model]
+    cmd = [
+        "claude",
+        "-p",
+        "--model",
+        model,
+        "--allowedTools",
+        SCOUT_ALLOWED_TOOLS,
+        "--max-budget-usd",
+        SCOUT_MAX_BUDGET_USD,
+    ]
     try:
         result = runner(cmd, input=prompt, timeout=timeout)
     except FileNotFoundError as exc:
