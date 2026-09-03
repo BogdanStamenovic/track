@@ -1,0 +1,26 @@
+schema: 1
+name: track
+description: Give it an assignment, it hunts down who sells that cheap and where, then keeps watching.
+homepage: https://github.com/BogdanStamenovic/track
+tags: [cli, deals, scheduler, python]
+install:
+  platforms: [linux, darwin, windows]
+  setup:
+    linux:
+      - python -m venv .venv
+      - .venv/bin/python -m pip install -e .
+    darwin:
+      - python -m venv .venv
+      - .venv/bin/python -m pip install -e .
+    windows:
+      - python -m venv .venv
+      - '.venv\Scripts\python.exe -m pip install -e .'
+  update:
+    linux: [.venv/bin/python -m pip install -e .]
+    darwin: [.venv/bin/python -m pip install -e .]
+    windows: ['.venv\Scripts\python.exe -m pip install -e .']
+  remove: []
+command:
+  linux: .venv/bin/track
+  darwin: .venv/bin/track
+  windows: '.venv\Scripts\track.exe'
