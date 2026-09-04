@@ -88,7 +88,8 @@ def test_a_blocked_site_never_retires_a_listing(store: Store, assignment) -> Non
     assert status.retired_at is None
     assert status.check_failures == 0
     assert outcome.blocked == 1
-    assert "could not check" in status.retired_note
+    assert "could not check" in status.last_check_note
+    assert status.retired_note is None
 
 
 def test_one_unreachable_check_is_not_enough_to_retire(store: Store, assignment) -> None:
@@ -275,3 +276,18 @@ def test_superseding_records_what_beat_it(store: Store, assignment) -> None:
     assert status.retired_reason == "superseded"
     assert status.superseded_by == cheap
     assert store.listing_status(assignment.id, cheap).retired_at is None
+
+
+def test_a_live_check_leaves_no_retirement_note_behind(store: Store, assignment) -> None:
+    """The outcome of checking a listing that is fine is not a retirement."""
+    key = _add(store, assignment.id, "ThinkPad T490", 300.0, "https://kp/1")
+
+    reap(
+        store, assignment.id, EMPTY_MARKET, seen_keys=set(),
+        check=_checker(ListingCheck("https://kp/1", "live", note="still listed at 300 EUR")),
+    )
+
+    status = store.listing_status(assignment.id, key)
+    assert status.last_check_note == "still listed at 300 EUR"
+    assert status.retired_note is None
+    assert status.retired_at is None

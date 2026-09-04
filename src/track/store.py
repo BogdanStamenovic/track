@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS listing_status (
     times_seen      INTEGER NOT NULL DEFAULT 1,
     last_checked_at TEXT,
     check_failures  INTEGER NOT NULL DEFAULT 0,
+    last_check_note TEXT,
     retired_at      TEXT,
     retired_reason  TEXT,
     retired_note    TEXT,
@@ -123,7 +124,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_assignment ON runs(assignment_id);
 CREATE VIEW IF NOT EXISTS listings_current AS
 SELECT f.*,
        s.first_seen_at, s.last_seen_at, s.times_seen,
-       s.last_checked_at, s.check_failures,
+       s.last_checked_at, s.check_failures, s.last_check_note,
        s.retired_at, s.retired_reason, s.retired_note, s.superseded_by
 FROM findings f
 JOIN listing_status s
@@ -151,6 +152,7 @@ _ADDED_COLUMNS = [
     ("findings", "listing_posted_at", "TEXT"),
     ("findings", "listing_age_days", "REAL"),
     ("findings", "product_year", "INTEGER"),
+    ("listing_status", "last_check_note", "TEXT"),
 ]
 
 
@@ -261,17 +263,21 @@ class Store:
                 "OR check_failures > 0 OR last_checked_at IS NOT NULL"
             ).fetchall()
         }
+        # `last_check_note` predates nothing, but a database opened by an
+        # older build will not have the column; ADD COLUMN has already run by
+        # the time any of this does.
         self._conn.execute("DELETE FROM listing_status")
         self._rebuild_listing_status()
         for (assignment_id, old_key), row in keep.items():
             new_key = moved.get((assignment_id, old_key), old_key)
             self._conn.execute(
                 "UPDATE listing_status SET last_checked_at = ?, check_failures = ?, "
-                "retired_at = ?, retired_reason = ?, retired_note = ?, superseded_by = ? "
-                "WHERE assignment_id = ? AND dedup_key = ?",
+                "last_check_note = ?, retired_at = ?, retired_reason = ?, retired_note = ?, "
+                "superseded_by = ? WHERE assignment_id = ? AND dedup_key = ?",
                 (
                     row["last_checked_at"],
                     row["check_failures"],
+                    row["last_check_note"],
                     row["retired_at"],
                     row["retired_reason"],
                     row["retired_note"],
@@ -710,7 +716,7 @@ class Store:
         evidence about the site and none at all about the listing.
         """
         self._conn.execute(
-            "UPDATE listing_status SET last_checked_at = ?, retired_note = ?, "
+            "UPDATE listing_status SET last_checked_at = ?, last_check_note = ?, "
             "check_failures = CASE WHEN ? THEN 0 ELSE check_failures + 1 END "
             "WHERE assignment_id = ? AND dedup_key = ?",
             (_now(), note, conclusive, assignment_id, dedup_key),
@@ -725,7 +731,7 @@ class Store:
     def record_block(self, assignment_id: str, dedup_key: str, note: str | None) -> None:
         """A site refused the check. Timestamped, noted, and never counted."""
         self._conn.execute(
-            "UPDATE listing_status SET last_checked_at = ?, retired_note = ? "
+            "UPDATE listing_status SET last_checked_at = ?, last_check_note = ? "
             "WHERE assignment_id = ? AND dedup_key = ?",
             (_now(), note, assignment_id, dedup_key),
         )
@@ -800,6 +806,7 @@ def _row_to_listing_status(row: sqlite3.Row) -> ListingStatus:
         times_seen=row["times_seen"],
         last_checked_at=row["last_checked_at"],
         check_failures=row["check_failures"],
+        last_check_note=row["last_check_note"],
         retired_at=row["retired_at"],
         retired_reason=row["retired_reason"],
         retired_note=row["retired_note"],

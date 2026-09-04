@@ -87,9 +87,14 @@ class ListingStatus:
     times_seen: int
     last_checked_at: str | None = None
     check_failures: int = 0
+    # The last thing a check established, retired or not -- including "the
+    # site refused the request", which is why it is kept apart from
+    # `retired_note`. A field whose name says "retired" while holding the
+    # outcome of a check on a live listing is a field that will be read wrong.
+    last_check_note: str | None = None
     retired_at: str | None = None
-    retired_reason: str | None = None  # "gone" | "sold" | "superseded"
-    retired_note: str | None = None
+    retired_reason: str | None = None  # "gone" | "superseded"
+    retired_note: str | None = None  # why it was retired, set only when it was
     superseded_by: str | None = None  # dedup_key of the listing that beat it
 
 
