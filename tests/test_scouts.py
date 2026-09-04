@@ -410,3 +410,34 @@ def test_the_check_prompt_carries_the_block_policy() -> None:
 def test_a_re_check_gets_longer_than_a_search_scout() -> None:
     """It fetches a page per listing where a listing scout runs two searches."""
     assert CHECK_TIMEOUT > DEFAULT_TIMEOUT
+
+
+# -- tolerating what a scout actually emits -------------------------------
+
+
+def test_a_second_array_does_not_cost_the_whole_source() -> None:
+    """Seen live twice: `[]` then the real array, one lost source per run."""
+    result = scout_listings(
+        "a laptop", "KP",
+        runner=_runner(envelope('[]\n[{"source": "KP", "title": "T490", "price": 230}]')),
+    )
+    assert [f.title for f in result.findings] == ["T490"]
+
+
+def test_a_footnote_after_the_array_does_not_cost_it_either() -> None:
+    result = scout_listings(
+        "a laptop", "KP",
+        runner=_runner(
+            envelope('[{"source": "KP", "title": "T490", "price": 230}]\n\nSee [1] for details.')
+        ),
+    )
+    assert [f.title for f in result.findings] == ["T490"]
+
+
+def test_output_with_no_array_at_all_is_still_an_error() -> None:
+    with pytest.raises(ScoutError, match="no JSON array"):
+        scout_listings("a laptop", "KP", runner=_runner(envelope("I could not reach the site.")))
+
+
+def test_an_honestly_empty_result_is_not_an_error() -> None:
+    assert scout_listings("a laptop", "KP", runner=_runner(envelope("[]"))).findings == []

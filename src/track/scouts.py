@@ -389,18 +389,35 @@ def _unwrap_envelope(stdout: str) -> tuple[str, float]:
 
 
 def _parse_json_array(raw: str) -> list[dict[str, Any]]:
+    """The listing array out of a scout's answer, whatever else it said.
+
+    Taking the span from the first `[` to the last `]` looks right and is
+    wrong the moment a scout writes two arrays, because the span then covers
+    both and the text between them. That is not hypothetical: two runs lost a
+    whole source each to `Extra data: line 2 column 1 (char 3)`, which is
+    exactly what `[]` followed by the real array produces. A trailing "see
+    [1] for details" does the same thing.
+
+    So every `[` is tried as the start of a value and the richest array wins.
+    Richest rather than first, because the empty one usually comes first; and
+    an array of listings always beats a footnote marker.
+    """
     text = raw.strip()
-    start = text.find("[")
-    end = text.rfind("]")
-    if start == -1 or end == -1 or end < start:
+    decoder = json.JSONDecoder()
+    best: list[dict[str, Any]] | None = None
+    for start in (i for i, ch in enumerate(text) if ch == "["):
+        try:
+            value, _end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, list):
+            continue
+        items = [item for item in value if isinstance(item, dict)]
+        if best is None or len(items) > len(best):
+            best = items
+    if best is None:
         raise ScoutError(f"scout output had no JSON array: {text[:200]!r}")
-    try:
-        data = json.loads(text[start : end + 1])
-    except json.JSONDecodeError as exc:
-        raise ScoutError(f"scout output was not valid JSON: {exc}") from exc
-    if not isinstance(data, list):
-        raise ScoutError("scout output JSON was not a list")
-    return [item for item in data if isinstance(item, dict)]
+    return best
 
 
 def _market_clause(market: str | None) -> str:
