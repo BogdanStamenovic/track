@@ -1,0 +1,17 @@
+# systemd --user unit. Install with:
+#   ln -s ~/data/track/contrib/track-web.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now track-web
+#
+# Not installed by the package: whether this runs all the time is his call.
+[Unit]
+Description=track web, a local viewer over track's findings
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/data/track/.venv/bin/track web serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -117,6 +117,69 @@ b15f0a7b: a 16GB DDR4-3200 desktop RAM kit, used or open-box
   Facebook Marketplace: 1 listings, 0 priced (0%), from ?, median ?
 ```
 
+## The web view
+
+`track web` serves the findings as a local site: one card per listing with the
+product link, the price, the score and what it was measured against, why the
+scout recommended it, and how old it is. Read-only — it opens the database
+`mode=ro` and never writes, so it cannot lock or migrate a run in progress.
+
+```
+track web                 # localhost + this host's tailnet address, port 8791
+track web serve -p 9000 --host 127.0.0.1
+track web info            # what the database holds and what it is missing
+track web info --json
+```
+
+| option | meaning |
+|---|---|
+| `--db PATH` | database to read (default: the one `track` itself uses) |
+| `--host ADDR` | address to bind, repeatable. Default: `127.0.0.1` plus the tailnet address if the host has one. Never a wildcard |
+| `-p, --port N` | port, default 8791 |
+| `-v` / `-q` | per-request logging / quiet |
+
+Pages: `/` lists the assignments, `/a/<assignment_id>` lists its listings
+(sort by best score, newest, cheapest or oldest sighting; filter by text; show
+or hide retired listings), `/healthz` returns `ok`.
+
+**What it shows per listing.** `findings` is append-only — one row per
+*sighting* — so the page collapses sightings into one card per
+`(assignment_id, dedup_key)`. First-seen, last-seen and the sighting count come
+from `listing_status`, which is authoritative because it has seen runs a single
+query has not. Price and score come from the most recent sighting that actually
+had one, badged `last known` when that was not the newest sighting, so a later
+null cannot erase a price we observed.
+
+**It never invents a value.** A missing price reads *no price listed*, a
+missing rationale *no reason recorded*, an unscored listing *not scored* rather
+than zero — and unscored listings sort last instead of bottom. Where a whole
+field is blank for every card, one folded line says whether that is because
+track cannot record it or because nothing has captured it yet; those are
+different facts and only the second fixes itself on the next run.
+
+**Retired and unreachable are shown differently, on purpose.** A listing is
+struck through only when `listing_status.retired_at` is set, with track's own
+`retired_reason` and `retired_note` on the card. A listing the reaper simply
+could not reach is marked `unverified` and left intact, saying what stopped the
+check — a 403 is not a sold item, and the page does not let one look like the
+other. Nothing is ever inferred from "absent in the latest run".
+
+**Serving it permanently.** `contrib/track-web.service` is a `systemd --user`
+unit; it is not installed by the package.
+
+```
+ln -s ~/data/track/contrib/track-web.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now track-web
+```
+
+**Limitations.** No authentication — it binds localhost and the tailnet only,
+and must not be put behind a public proxy. The score bar is track's own 0–1
+number, not a percentage of anything. A `dedup_key` collision would merge two
+different listings into one card; that is `track`'s key and the web view trusts
+it. Column names on `findings` are resolved against a candidate list rather
+than pinned, so a rename shows up as a named gap on the page instead of a
+crash.
+
 ## How it works
 
 **Scouts.** Every run fans out one `claude -p --model sonnet` session per
