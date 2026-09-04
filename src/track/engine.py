@@ -216,8 +216,11 @@ def run_assignment(
     # which is the failure this whole scoring change exists to fix.
     market = Market(
         [
+            # Live listings only. A reference price is what you could pay
+            # today, so a listing the reaper has already retired should not
+            # go on setting the going rate for the ones still on offer.
             Comparable(f.dedup_key, f.title, f.price, f.currency)
-            for f in store.latest_findings(assignment.id)
+            for f in store.live_listings(assignment.id)
             if f.price is not None
         ]
         + [

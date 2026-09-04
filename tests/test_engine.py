@@ -672,3 +672,18 @@ def test_the_reapers_scout_is_counted_in_the_runs_usage(store: Store, monkeypatc
     run_assignment(store, store.get_assignment(a.id))
 
     assert store.list_runs(a.id, 1)[0].cost_usd == pytest.approx(0.27)
+
+
+def test_a_retired_listing_no_longer_sets_the_going_rate(store: Store, monkeypatch) -> None:
+    """A reference price is what you could pay today."""
+    a = store.add_assignment("a gpu", 3600)
+    store.upsert_source(a.id, "KP")
+    _fake_scouts(monkeypatch, [_sf("MSI GeForce RTX 3060 12GB VENTUS", 600.0, url="https://kp/1")])
+    run_assignment(store, a)
+    store.retire(a.id, store.latest_findings(a.id)[0].dedup_key, reason="gone")
+
+    _fake_scouts(monkeypatch, [_sf("ASUS GeForce RTX 3060 12GB VENTUS", 300.0, url="https://kp/2")])
+    outcome = run_assignment(store, store.get_assignment(a.id))
+
+    assert outcome.findings[0].reference_price is None
+    assert outcome.findings[0].score_basis == "cheapness"

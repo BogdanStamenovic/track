@@ -441,6 +441,10 @@ from deploying it that way, rather than assumptions:
   $0.10–$0.45 per run in testing, five scouts wide, and `track show` reports
   the running total per assignment. Treat it as a measure of how much work a
   run did.
+- **Retirement is only as good as one scout's reading of a page.** A listing
+  that is quietly reserved rather than marked sold reads as live, and a page
+  that renders its status in JavaScript may read as either. The four states
+  are what a read-only fetch can honestly distinguish, not ground truth.
 - **The `wake` integration is one file.** `scheduler.py` is the only place
   that knows wake's CLI shape; if that contract changes, nothing else does.
 - **Self-re-arming needs `wake` 7041d08 or newer.** Because `track run`
@@ -468,7 +472,13 @@ from deploying it that way, rather than assumptions:
 - No currency *conversion*. Prices are never pooled across currencies, which
   is the correctness-critical half, but track also cannot tell you whether
   6,900 RSD beats 60 EUR. It reports both and leaves the arithmetic to you.
-- No condition or specification matching beyond what the assignment text tells
-  a scout. It will happily report a 32GB kit for a 16GB assignment if a scout
-  thought it was relevant.
+- No condition or specification *matching* beyond what the assignment text
+  tells a scout. Condition is now recorded when a listing states it, but
+  nothing filters on it: track will happily report a 32GB kit for a 16GB
+  assignment if a scout thought it was relevant.
 - No alerting threshold — every run posts, even a quiet one.
+- Nothing re-checks a listing that came back without a URL. It can be retired
+  as superseded, never as gone.
+- Supersession almost never fires on the data measured so far, by design —
+  see the table above. If the intent is "hide anything worse than the best
+  find", that is a ranking question and the score already answers it.
