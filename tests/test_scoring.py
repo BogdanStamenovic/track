@@ -332,3 +332,15 @@ def test_only_the_closest_peers_are_recorded() -> None:
     assert ref is not None
     assert ref.n == MAX_PEERS_RECORDED
     assert list(ref.peers) == sorted(ref.peers, key=lambda p: -p[1])
+
+
+def test_renaming_a_site_does_not_split_a_listing_in_two() -> None:
+    """Scouts renamed Konovo.rs mid-history; the URL is the same listing."""
+    url = "https://konovo.rs/proizvod/elitebook-855"
+    assert dedup_key("Konovo.rs", "HP EliteBook 855 G8", url) == dedup_key(
+        "Konovo.rs (formerly Polovnilaptop.rs)", "HP EliteBook 855 G8", url
+    )
+
+
+def test_without_a_url_the_source_still_separates_two_sites() -> None:
+    assert dedup_key("eBay", "ThinkPad T490", None) != dedup_key("Newegg", "ThinkPad T490", None)

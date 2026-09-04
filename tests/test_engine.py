@@ -12,7 +12,7 @@ from track.engine import (
     run_command,
 )
 from track.errors import ScoutError
-from track.scouts import ScoutFinding, ScoutResult
+from track.scouts import ListingCheck, ScoutFinding, ScoutResult
 from track.store import Store
 
 
@@ -21,6 +21,10 @@ def no_posting(monkeypatch):
     """Nothing in this module may reach Discord or a scheduler."""
     monkeypatch.setattr("track.engine.post_summary", lambda *a, **k: None)
     monkeypatch.setattr("track.engine.scheduler.schedule", _unexpected("schedule"))
+    # The reaper spends a scout of its own on every run. Tests that care
+    # about it hand `reap` a fake checker; the rest get one that answers
+    # nothing, which is the honest default -- an unanswered check is unknown.
+    monkeypatch.setattr("track.reaper.scouts.check_listings", lambda urls, **k: ([], 0.0))
 
 
 def _unexpected(what: str):
@@ -631,3 +635,40 @@ def test_a_listing_seen_again_updates_its_status_without_losing_its_first_sighti
 
     assert later.first_seen_at == first.first_seen_at
     assert later.times_seen == 2
+
+
+# -- the reaper ----------------------------------------------------------
+
+
+def test_a_run_re_checks_listings_it_did_not_see(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    store.upsert_source(a.id, "KP")
+    _fake_scouts(monkeypatch, [_sf("ThinkPad T490", 300.0, url="https://kp/1")])
+    run_assignment(store, a)
+
+    checked: list[list[str]] = []
+    monkeypatch.setattr(
+        "track.reaper.scouts.check_listings",
+        lambda urls, **k: (checked.append(urls), ([ListingCheck(urls[0], "gone")], 0.0))[1],
+    )
+    _fake_scouts(monkeypatch, [_sf("ThinkPad X1", 400.0, url="https://kp/2")])
+    outcome = run_assignment(store, store.get_assignment(a.id))
+
+    assert checked == [["https://kp/1"]]
+    assert outcome.reaped.retired_gone == ["ThinkPad T490"]
+    assert [f.title for f in store.live_listings(a.id)] == ["ThinkPad X1"]
+
+
+def test_the_reapers_scout_is_counted_in_the_runs_usage(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    store.upsert_source(a.id, "KP")
+    _fake_scouts(monkeypatch, [_sf("ThinkPad T490", 300.0, url="https://kp/1")])
+    run_assignment(store, a)
+
+    monkeypatch.setattr(
+        "track.reaper.scouts.check_listings", lambda urls, **k: ([], 0.07)
+    )
+    _fake_scouts(monkeypatch, [_sf("ThinkPad X1", 400.0, url="https://kp/2")], cost=0.2)
+    run_assignment(store, store.get_assignment(a.id))
+
+    assert store.list_runs(a.id, 1)[0].cost_usd == pytest.approx(0.27)

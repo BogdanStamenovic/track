@@ -548,3 +548,44 @@ def test_no_schedule_does_not_claim_an_interval(capsys, db: Path) -> None:
     err = capsys.readouterr().err
     assert "every 6h" not in err
     assert "not scheduled" in err
+
+
+def test_show_explains_why_a_find_was_recommended(capsys, db: Path) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    with Store(db) as store:
+        run_id = store.start_run(assignment_id)
+        store.add_finding(
+            assignment_id, run_id, "KP", "ThinkPad T490", 230.0, "EUR", "https://kp/1",
+            "k1", 0.82, True, reference_price=300.0, reference_n=4, score_basis="mispricing",
+            rationale="Cheapest T490 with 512GB; three others sit at 280-300 EUR.",
+            condition="used", product_year=2019,
+        )
+    capsys.readouterr()
+
+    main(["--db", str(db), "show", assignment_id])
+    out = capsys.readouterr().out
+
+    assert "score 0.82 mispricing" in out
+    assert "vs 300.00 EUR from 4 comparable(s)" in out
+    assert "Cheapest T490 with 512GB" in out
+    assert "2019 model" in out
+    assert "first seen" in out
+
+
+def test_show_lists_what_has_been_retired(capsys, db: Path) -> None:
+    assignment_id = _add(db, "--notify", "x")
+    with Store(db) as store:
+        run_id = store.start_run(assignment_id)
+        store.add_finding(
+            assignment_id, run_id, "KP", "ThinkPad T490", 230.0, "EUR", "https://kp/1",
+            "k1", 0.8, True,
+        )
+        store.retire(assignment_id, "k1", reason="gone", note="oglas je prodat")
+    capsys.readouterr()
+
+    main(["--db", str(db), "show", assignment_id])
+    out = capsys.readouterr().out
+
+    assert "retired (1)" in out
+    assert "[gone]" in out
+    assert "oglas je prodat" in out

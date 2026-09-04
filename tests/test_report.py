@@ -6,6 +6,7 @@ import pytest
 
 from track.errors import ReportError
 from track.models import Assignment, Finding, SourceStat
+from track.reaper import ReapOutcome
 from track.report import build_summary, post_summary
 
 
@@ -377,3 +378,46 @@ def test_multiple_currencies_are_labelled_as_per_currency() -> None:
     summary = build_summary(_assignment(), [_finding()], 3, stats=stats)
 
     assert "(per currency)" in summary, "must not imply 7000 RSD is dearer than 60 EUR"
+
+
+# -- the reaper's half of the summary ------------------------------------
+
+
+def test_retirements_are_named_in_the_summary() -> None:
+    summary = build_summary(
+        _assignment(), [_finding()], 3,
+        reaped=ReapOutcome(checked=4, retired_gone=["ThinkPad T490"]),
+    )
+    assert "Re-checked 4 older listing(s)" in summary
+    assert "gone — ThinkPad T490" in summary
+
+
+def test_an_unverifiable_listing_is_never_reported_as_sold() -> None:
+    """A 403 is evidence about the site, and the summary has to say so."""
+    summary = build_summary(
+        _assignment(), [_finding()], 3,
+        reaped=ReapOutcome(checked=5, blocked=3, inconclusive=2),
+    )
+    assert "recorded as unknown, not as sold" in summary
+    assert "the site would not let us check" in summary
+    assert "gone" not in summary
+
+
+def test_a_clean_sweep_says_so() -> None:
+    summary = build_summary(_assignment(), [_finding()], 3, reaped=ReapOutcome(checked=6))
+    assert "6 still on offer" in summary
+
+
+def test_checks_that_established_nothing_are_not_reported_as_still_on_offer() -> None:
+    """"All still on offer" next to "2 unreachable" is a contradiction, and
+    the run that printed it had established nothing at all."""
+    summary = build_summary(
+        _assignment(), [_finding()], 3, reaped=ReapOutcome(checked=2, inconclusive=2)
+    )
+    assert "still on offer" not in summary
+    assert "2 unreachable" in summary
+
+
+def test_nothing_re_checked_adds_no_noise() -> None:
+    summary = build_summary(_assignment(), [_finding()], 3, reaped=ReapOutcome())
+    assert "Re-checked" not in summary

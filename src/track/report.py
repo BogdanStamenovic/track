@@ -20,6 +20,7 @@ from pathlib import Path
 
 from .errors import ReportError
 from .models import Assignment, Finding, SourceStat
+from .reaper import ReapOutcome
 
 HOTLINE_SAY_BIN = "hotline-say"
 _FALLBACK_PATH = Path.home() / ".claude" / "bin" / HOTLINE_SAY_BIN
@@ -70,6 +71,7 @@ def build_summary(
     cost_usd: float = 0.0,
     schedule_error: str | None = None,
     scout_failures: int = 0,
+    reaped: ReapOutcome | None = None,
 ) -> str:
     """A tight Discord-shaped summary of one run."""
     over_ceiling = 0
@@ -133,6 +135,8 @@ def build_summary(
         names = ", ".join(dict.fromkeys(s.name for s in unreadable))
         lines.append(f"  no price readable from: {names}")
 
+    lines.extend(_reaper_lines(reaped))
+
     if scout_failures and new_findings:
         lines.append(f"\n_{scout_failures} scout(s) failed; this run saw less than usual._")
     if cost_usd:
@@ -154,6 +158,38 @@ def build_summary(
             f"again until it is rescheduled (`track resume {assignment.id}`)."
         )
     return "\n".join(lines)
+
+
+def _reaper_lines(reaped: ReapOutcome | None) -> list[str]:
+    """What stopped being on the board, and what could not be established.
+
+    The unchecked half matters as much as the retirements. A run that could
+    not reach a third of the back catalogue has not verified that catalogue,
+    and saying only "retired 2" would read as though it had.
+    """
+    if reaped is None or not reaped.checked:
+        return []
+    lines = [f"\nRe-checked {reaped.checked} older listing(s):"]
+    for title in reaped.retired_gone[:3]:
+        lines.append(f"  ✗ gone — {title}")
+    for title in reaped.retired_superseded[:3]:
+        lines.append(f"  ✗ superseded — {title}")
+    hidden = reaped.retired - len(reaped.retired_gone[:3]) - len(reaped.retired_superseded[:3])
+    if hidden > 0:
+        lines.append(f"  …and {hidden} more retired.")
+    established = reaped.checked - reaped.blocked - reaped.inconclusive
+    if not reaped.retired and established:
+        lines.append(f"  {established} still on offer.")
+    unresolved = []
+    if reaped.blocked:
+        unresolved.append(f"{reaped.blocked} the site would not let us check")
+    if reaped.inconclusive:
+        unresolved.append(f"{reaped.inconclusive} unreachable")
+    if unresolved:
+        lines.append(
+            f"  _{', '.join(unresolved)} — recorded as unknown, not as sold._"
+        )
+    return lines
 
 
 def _body(new_findings: list[Finding]) -> list[str]:

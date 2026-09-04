@@ -76,11 +76,19 @@ def dedup_key(
     product page came back under four slightly different title strings across
     four runs, and keying those by title would turn one listing with a price
     history into four listings with none.
+
+    The source name is part of the key only in the title fallback. A URL
+    already names the site, and folding in what a scout decided to *call* it
+    that run splits one listing in two the moment the name drifts -- which it
+    does: the same pages came back under "Konovo.rs" and "Konovo.rs (formerly
+    Polovnilaptop.rs)", and under "polovnilaptopovi.rs" and
+    "polovnilaptopovi.rs (Restart Laptopovi)". Five listings on record were
+    duplicates of that kind. Without a URL the source is all that separates
+    two sites using the same title, so there it stays.
     """
     if url and url_basis(url) not in index_bases:
-        basis = url_basis(url)
-    else:
-        basis = title_basis(title)
+        return hashlib.sha1(url_basis(url).encode()).hexdigest()[:16]
+    basis = title_basis(title)
     return hashlib.sha1(f"{source.strip().lower()}|{basis}".encode()).hexdigest()[:16]
 
 
@@ -244,6 +252,15 @@ class Market:
 
     def _weight(self, tokens: Iterable[str]) -> float:
         return sum(self._weights.get(t, self._unseen) for t in tokens)
+
+    def weight_of(self, tokens: Iterable[str]) -> float:
+        """This snapshot's distinctiveness weighting, for a second opinion.
+
+        The reaper needs a *symmetric* similarity where this class uses an
+        asymmetric one, and it has to be weighted against the same corpus to
+        be comparable, so the weighting is exposed rather than recomputed.
+        """
+        return self._weight(tokens)
 
     def _containment(self, a: frozenset[str], b: frozenset[str]) -> float:
         """Shared distinctive weight over the *shorter* title's.

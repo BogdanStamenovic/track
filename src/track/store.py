@@ -205,12 +205,16 @@ class Store:
         merged onto one key become separately reachable again, which for the
         database this shipped against means 46 listings that
         `latest_findings` could not see.
+
+        Version 2 also dropped the source name from URL-keyed identity, which
+        merged five listings back together that had split when a scout
+        renamed the site between runs.
         """
-        name = "repair_dedup_keys_v1"
+        name = "repair_dedup_keys_v2"
         if self._applied(name):
             return
         rows = self._conn.execute(
-            "SELECT id, assignment_id, run_id, source, title, url FROM findings"
+            "SELECT id, assignment_id, run_id, source, title, url, dedup_key FROM findings"
         ).fetchall()
         if rows:
             per_run: dict[tuple[str, int], list[tuple[str | None, str]]] = {}
@@ -223,13 +227,81 @@ class Store:
                 discovered.setdefault(assignment_id, set()).update(_index_url_bases(listings))
             for assignment_id, bases in discovered.items():
                 self._register_index_urls(assignment_id, bases)
+            moved: dict[tuple[str, str], str] = {}
             for row in rows:
                 bases = discovered.get(row["assignment_id"], set())
                 key = _dedup_key(row["source"], row["title"], row["url"], bases)
-                self._conn.execute(
-                    "UPDATE findings SET dedup_key = ? WHERE id = ?", (key, row["id"])
-                )
+                if key != row["dedup_key"]:
+                    moved[(row["assignment_id"], row["dedup_key"])] = key
+                    self._conn.execute(
+                        "UPDATE findings SET dedup_key = ? WHERE id = ?", (key, row["id"])
+                    )
+            if moved:
+                self._remap_listing_status(moved)
         self._mark_applied(name)
+
+    def _remap_listing_status(self, moved: dict[tuple[str, str], str]) -> None:
+        """Follow the listings whose keys the repair just changed.
+
+        `listing_status` is derived from `findings` by key, so rewriting keys
+        without this strands every status row on a key nothing points at any
+        more. It happened: 33 of 42 listings lost their status row and became
+        invisible to the reaper, which then had nine listings to re-check
+        instead of forty-two and no error anywhere.
+
+        The counting columns are re-derived from the rows themselves, since
+        merged listings need their sightings re-added rather than picked from
+        one side. The reaper's verdicts cannot be re-derived, so they are
+        carried across by hand.
+        """
+        keep = {
+            (row["assignment_id"], row["dedup_key"]): row
+            for row in self._conn.execute(
+                "SELECT * FROM listing_status WHERE retired_at IS NOT NULL "
+                "OR check_failures > 0 OR last_checked_at IS NOT NULL"
+            ).fetchall()
+        }
+        self._conn.execute("DELETE FROM listing_status")
+        self._rebuild_listing_status()
+        for (assignment_id, old_key), row in keep.items():
+            new_key = moved.get((assignment_id, old_key), old_key)
+            self._conn.execute(
+                "UPDATE listing_status SET last_checked_at = ?, check_failures = ?, "
+                "retired_at = ?, retired_reason = ?, retired_note = ?, superseded_by = ? "
+                "WHERE assignment_id = ? AND dedup_key = ?",
+                (
+                    row["last_checked_at"],
+                    row["check_failures"],
+                    row["retired_at"],
+                    row["retired_reason"],
+                    row["retired_note"],
+                    moved.get((assignment_id, row["superseded_by"] or ""), row["superseded_by"]),
+                    assignment_id,
+                    new_key,
+                ),
+            )
+
+    def _rebuild_listing_status(self) -> None:
+        """Derive first seen, last seen and sighting counts from the findings.
+
+        Also drops status rows nothing points at any more. Those can only
+        come from a key rewrite -- findings themselves are never deleted, so
+        a retired listing always keeps the rows that anchor its status -- and
+        left in place they are cruft that reads as live listings to anything
+        querying the table directly rather than through the view.
+        """
+        self._conn.execute(
+            "DELETE FROM listing_status WHERE NOT EXISTS ("
+            "  SELECT 1 FROM findings f WHERE f.assignment_id = listing_status.assignment_id"
+            "    AND f.dedup_key = listing_status.dedup_key)"
+        )
+        self._conn.execute(
+            "INSERT INTO listing_status "
+            "(assignment_id, dedup_key, first_seen_at, last_seen_at, times_seen) "
+            "SELECT assignment_id, dedup_key, MIN(found_at), MAX(found_at), COUNT(*) "
+            "FROM findings GROUP BY assignment_id, dedup_key "
+            "ON CONFLICT(assignment_id, dedup_key) DO NOTHING"
+        )
 
     def _backfill_listing_status(self) -> None:
         """Derive first/last seen and sighting counts from existing findings.
@@ -242,14 +314,13 @@ class Store:
         """
         name = "backfill_listing_status_v1"
         if self._applied(name):
+            # Still cheap and still idempotent, and it has to run anyway: a
+            # key repair in the same open can strand rows, and a marker set
+            # by an earlier version of the schema must not leave a listing
+            # without a status row.
+            self._rebuild_listing_status()
             return
-        self._conn.execute(
-            "INSERT INTO listing_status "
-            "(assignment_id, dedup_key, first_seen_at, last_seen_at, times_seen) "
-            "SELECT assignment_id, dedup_key, MIN(found_at), MAX(found_at), COUNT(*) "
-            "FROM findings GROUP BY assignment_id, dedup_key "
-            "ON CONFLICT(assignment_id, dedup_key) DO NOTHING"
-        )
+        self._rebuild_listing_status()
         self._mark_applied(name)
 
     # -- index urls ------------------------------------------------------
@@ -603,6 +674,94 @@ class Store:
             ).fetchall()
         }
         return [f for f in self.latest_findings(assignment_id) if f.dedup_key not in retired]
+
+    def listings_due_for_check(
+        self, assignment_id: str, *, exclude: set[str], limit: int
+    ) -> list[Finding]:
+        """Live listings this run did not see, least recently checked first.
+
+        Round-robin rather than newest-first, so a large back catalogue is
+        worked through over successive runs instead of the same few listings
+        being re-checked forever. Listings the run *did* see are excluded by
+        the caller: a listing a scout just found is alive, and re-fetching it
+        to confirm that would be the most expensive way to learn nothing.
+        """
+        rows = self._conn.execute(
+            "SELECT f.* FROM findings f JOIN listing_status s "
+            "  ON s.assignment_id = f.assignment_id AND s.dedup_key = f.dedup_key "
+            "WHERE f.assignment_id = ? AND s.retired_at IS NULL AND f.url IS NOT NULL "
+            "  AND f.id IN (SELECT MAX(id) FROM findings WHERE assignment_id = ? "
+            "               GROUP BY dedup_key) "
+            "ORDER BY COALESCE(s.last_checked_at, '') ASC, f.id ASC",
+            (assignment_id, assignment_id),
+        ).fetchall()
+        out = [_row_to_finding(row) for row in rows if row["dedup_key"] not in exclude]
+        return out[:limit]
+
+    def record_check(
+        self, assignment_id: str, dedup_key: str, *, conclusive: bool, note: str | None
+    ) -> int:
+        """Note that a listing was re-checked. Returns the failure count after.
+
+        `conclusive` is False for a check that could not establish anything --
+        a timeout, or a site that refused to talk to us. Those accumulate
+        toward retirement only when they are *inconclusive*; a site-level
+        block is recorded and explicitly does not count, because a 403 is
+        evidence about the site and none at all about the listing.
+        """
+        self._conn.execute(
+            "UPDATE listing_status SET last_checked_at = ?, retired_note = ?, "
+            "check_failures = CASE WHEN ? THEN 0 ELSE check_failures + 1 END "
+            "WHERE assignment_id = ? AND dedup_key = ?",
+            (_now(), note, conclusive, assignment_id, dedup_key),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT check_failures FROM listing_status WHERE assignment_id = ? AND dedup_key = ?",
+            (assignment_id, dedup_key),
+        ).fetchone()
+        return int(row["check_failures"]) if row else 0
+
+    def record_block(self, assignment_id: str, dedup_key: str, note: str | None) -> None:
+        """A site refused the check. Timestamped, noted, and never counted."""
+        self._conn.execute(
+            "UPDATE listing_status SET last_checked_at = ?, retired_note = ? "
+            "WHERE assignment_id = ? AND dedup_key = ?",
+            (_now(), note, assignment_id, dedup_key),
+        )
+        self._conn.commit()
+
+    def retire(
+        self,
+        assignment_id: str,
+        dedup_key: str,
+        *,
+        reason: str,
+        note: str | None = None,
+        superseded_by: str | None = None,
+    ) -> None:
+        """Mark a listing retired. Never deletes anything.
+
+        Every sighting the listing ever had stays exactly where it was, which
+        is what makes "what did that cost in July" answerable after the advert
+        is gone. Retirement is a fact about now, and a later sighting clears
+        it (see `_touch_listing`).
+        """
+        self._conn.execute(
+            "UPDATE listing_status SET retired_at = ?, retired_reason = ?, "
+            "retired_note = COALESCE(?, retired_note), superseded_by = ? "
+            "WHERE assignment_id = ? AND dedup_key = ?",
+            (_now(), reason, note, superseded_by, assignment_id, dedup_key),
+        )
+        self._conn.commit()
+
+    def retired_listings(self, assignment_id: str) -> list[ListingStatus]:
+        rows = self._conn.execute(
+            "SELECT * FROM listing_status WHERE assignment_id = ? AND retired_at IS NOT NULL "
+            "ORDER BY retired_at DESC",
+            (assignment_id,),
+        ).fetchall()
+        return [_row_to_listing_status(row) for row in rows]
 
     def comparables(self, finding_id: int) -> list[tuple[str, float]]:
         """The peer listings a finding's reference price was drawn from.

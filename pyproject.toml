@@ -38,6 +38,7 @@ track = "track.cli:main"
 packages = ["src/track"]
 
 [tool.pytest.ini_options]
+markers = ["subprocess: drives the subprocess boundary on purpose"]
 testpaths = ["tests"]
 
 [tool.ruff]

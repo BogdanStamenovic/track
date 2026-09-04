@@ -107,6 +107,22 @@ class ScoutFinding:
 
 
 @dataclass(frozen=True, slots=True)
+class ListingCheck:
+    """What a re-check found at one listing's URL.
+
+    `state` is deliberately four-valued rather than a boolean, because the
+    difference between "the page says this sold" and "the site would not talk
+    to us" is the whole difference between retiring a listing and libelling
+    one.
+    """
+
+    url: str
+    state: str  # "live" | "gone" | "blocked" | "unknown"
+    price: float | None = None
+    note: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ScoutResult:
     """One scout's return, plus what it cost to get it."""
 
@@ -232,6 +248,79 @@ def _year(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return year if 1990 <= year <= datetime.now(timezone.utc).year + 1 else None
+
+
+CHECK_SCOUT_TEMPLATE = """You are checking whether listings are still for sale.
+Fetch each URL below and report what you find. Do not buy anything and do not
+contact anyone.
+
+{block_policy}
+
+For each URL answer with exactly one `state`:
+  "live"    - the listing page loaded and the item is still on offer
+  "gone"    - the page loaded and says the item is sold, reserved, expired,
+              removed, or the URL returns 404 / "no such advert"
+  "blocked" - the SITE refused you: 403, an anti-bot wall, a login gate, a
+              captcha, a paywall. This says nothing about the listing.
+  "unknown" - anything else: a timeout, a network error, or a page you could
+              reach but could not read an answer from
+
+`blocked` and `unknown` are correct, useful answers. Do not guess "gone" from
+a failed fetch and do not guess "live" from a search result -- only from the
+listing page itself. Give `price` when the page shows one, else null.
+
+URLs:
+{urls}
+
+Budget: at most {budget} tool calls, then answer with what you have; anything
+you did not reach is "unknown". Respond with ONLY a JSON array, no prose, no
+markdown fences:
+
+[{{"url": "<the url, copied exactly>", "state": "<live|gone|blocked|unknown>", "price": <number or null>, "note": "<what the page actually said, one short phrase>"}}]"""
+
+
+def check_listings(
+    urls: list[str],
+    *,
+    model: str = DEFAULT_MODEL,
+    timeout: int = DEFAULT_TIMEOUT,
+    runner: Runner = _default_runner,
+    max_budget_usd: str = SCOUT_MAX_BUDGET_USD,
+) -> tuple[list[ListingCheck], float]:
+    """Re-check a batch of listing URLs in one scout.
+
+    One scout for the whole batch rather than one per listing: this runs after
+    every research cycle, on top of the scouts that cycle already spent, and a
+    per-listing scout would multiply the cost of a run by the size of the
+    back catalogue.
+    """
+    if not urls:
+        return [], 0.0
+    prompt = CHECK_SCOUT_TEMPLATE.format(
+        block_policy=BLOCK_POLICY,
+        urls="\n".join(urls),
+        budget=len(urls) + 2,
+    )
+    raw, cost = _run_claude(
+        prompt, model=model, timeout=timeout, runner=runner, max_budget_usd=max_budget_usd
+    )
+    wanted = set(urls)
+    checks: list[ListingCheck] = []
+    for item in _parse_json_array(raw):
+        url = _text(item.get("url"), limit=2000)
+        if url not in wanted:
+            continue  # a scout that invented a URL does not get to retire one
+        state = (_text(item.get("state"), limit=20) or "").lower()
+        if state not in {"live", "gone", "blocked", "unknown"}:
+            state = "unknown"
+        try:
+            price = float(item["price"]) if item.get("price") is not None else None
+        except (TypeError, ValueError):
+            price = None
+        checks.append(
+            ListingCheck(url=url, state=state, price=price, note=_text(item.get("note"), limit=200))
+        )
+    return checks, cost
 
 
 def _build_cmd(model: str, max_budget_usd: str) -> list[str]:

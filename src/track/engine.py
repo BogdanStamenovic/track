@@ -15,7 +15,9 @@ Two ordering rules that the correctness of the scores depends on:
   this run's haul, because comparables often arrive together.
 * Findings are only ever appended. A run scores its own findings against the
   history that existed when it started and never touches an earlier row, so
-  history means "what this looked like at the time", permanently.
+  history means "what this looked like at the time", permanently. The reaper
+  that runs afterwards obeys the same rule -- it marks listings retired in a
+  separate table and deletes nothing.
 """
 
 from __future__ import annotations
@@ -23,10 +25,10 @@ from __future__ import annotations
 import shutil
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import scheduler, scouts
+from . import reaper, scheduler, scouts
 from .errors import TrackError
 from .models import Assignment, Finding, SourceStat
 from .report import build_summary, post_summary
@@ -152,6 +154,7 @@ class RunOutcome:
     posted: bool
     usable: int  # new findings that survived the price ceiling
     scout_failures: int
+    reaped: reaper.ReapOutcome = field(default_factory=reaper.ReapOutcome)
 
 
 def run_assignment(
@@ -267,7 +270,16 @@ def run_assignment(
         )
         store.upsert_source(assignment.id, raw.source, raw.url)
 
-    cost = discovery_cost + scouted.cost_usd
+    # After the run's own findings are in, not before: a listing this run saw
+    # is alive by definition and re-fetching it to confirm that is the most
+    # expensive way to learn nothing.
+    reaped = reaper.reap(
+        store, assignment.id, market, seen_keys=set(keys), warn=warn
+    )
+    if reaped.retired:
+        warn(f"retired {reaped.retired} listing(s) that are gone or superseded")
+
+    cost = discovery_cost + scouted.cost_usd + reaped.cost_usd
     store.finish_run(run_id, len(source_names), len(stored), cost)
     store.mark_ran(assignment.id)
 
@@ -288,6 +300,7 @@ def run_assignment(
         cost_usd=cost,
         schedule_error=schedule_error,
         scout_failures=scout_failures,
+        reaped=reaped,
     )
     posted = False
     if post:
@@ -313,4 +326,5 @@ def run_assignment(
         posted=posted,
         usable=len(usable),
         scout_failures=scout_failures,
+        reaped=reaped,
     )

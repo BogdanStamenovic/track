@@ -19,6 +19,7 @@ from track.scouts import (
     SCOUT_ALLOWED_TOOLS,
     SCOUT_TOOLS,
     ScoutFinding,
+    check_listings,
     discover_sources,
     run_scouts,
     scout_listings,
@@ -365,3 +366,40 @@ def test_bad_provenance_does_not_cost_the_listing() -> None:
     f = _one({"model_year": {"nested": "junk"}, "posted": 12345, "why": []})
     assert f.title == "ThinkPad T490"
     assert f.price == 230.0
+
+
+# -- re-checking listings ------------------------------------------------
+
+
+def _check(payload: str, urls: list[str] | None = None):
+    checks, _cost = check_listings(
+        urls or ["https://kp/1"], runner=_runner(envelope(payload))
+    )
+    return checks
+
+
+def test_a_check_reads_state_price_and_note() -> None:
+    checks = _check(
+        '[{"url": "https://kp/1", "state": "gone", "price": null, "note": "oglas je prodat"}]'
+    )
+    assert (checks[0].state, checks[0].note) == ("gone", "oglas je prodat")
+
+
+def test_an_unrecognised_state_degrades_to_unknown() -> None:
+    """Never to 'gone': a scout inventing a word must not retire a listing."""
+    assert _check('[{"url": "https://kp/1", "state": "probably sold?"}]')[0].state == "unknown"
+
+
+def test_a_check_for_a_url_we_did_not_ask_about_is_dropped() -> None:
+    assert _check('[{"url": "https://elsewhere/9", "state": "gone"}]') == []
+
+
+def test_checking_nothing_costs_nothing() -> None:
+    assert check_listings([]) == ([], 0.0)
+
+
+def test_the_check_prompt_carries_the_block_policy() -> None:
+    seen, runner = _capturing(envelope("[]"))
+    check_listings(["https://kp/1"], runner=runner)
+    assert "REAL stop" in seen["prompt"]
+    assert "blocked" in seen["prompt"]

@@ -243,6 +243,61 @@ run's listing differently from every other run's.
 as counters, because a counter can drift out of step with the rows it claims
 to summarise and a query cannot.
 
+**The reaper.** After every research cycle, one more scout re-checks
+listings the run did *not* see — a listing a scout just found is alive by
+definition — and retires what has gone. It works through the back catalogue
+least-recently-checked first, `MAX_CHECKS_PER_RUN` at a time, so a
+135-listing assignment is swept in about a dozen runs without a run's cost
+scaling with the size of its history.
+
+**Retirement is a marking. Nothing is ever deleted.** A retired listing keeps
+every sighting row it ever had, so "what did that cost in July" stays
+answerable after the advert is gone, and a listing that turns up alive in a
+later run is silently un-retired with its failure count reset.
+
+**A failed fetch is not proof a listing is dead.** Timeouts, rate limits and
+anti-bot walls are the normal weather of reading third-party marketplaces,
+and treating one as a death certificate would quietly empty the database of
+exactly the sources that block hardest. So the check answers one of four
+states and they are handled differently:
+
+| state | meaning | what happens |
+| --- | --- | --- |
+| `live` | the page loaded and it is still on offer | failure count reset |
+| `gone` | the page says sold/expired/removed, or 404 | retired immediately, `reason='gone'` |
+| `blocked` | the **site** refused: 403, captcha, login gate | recorded, **never counted** — a 403 is evidence about the site and none about the listing |
+| `unknown` | timeout, network error, unreadable page | counts; retired only after `FAILURES_BEFORE_RETIRING` separate checks |
+
+A URL nothing came back for is `unknown`, never `gone` — silence is the
+commonest way a batch check goes wrong, and eight unanswered URLs must not
+read as eight sales. That gap-filling lives in the reaper rather than the
+scout, so the guarantee holds whoever does the checking. The row records
+which signal fired, and the summary reports the blocked and unreachable
+counts next to the retirements rather than only the retirements.
+
+**Superseding is held to a much higher bar than price comparison**, and the
+two use different similarity measures on purpose. Finding a reference price
+wants recall, so it uses the overlap coefficient — shared weight over the
+*shorter* title. That measure ignores whatever the longer title says beyond
+the overlap, which is harmless for a median and fatal for a claim that one
+listing replaces another. Measured on 162 live listings, retiring anything
+with a cheaper comparable:
+
+| rule | retired | an actual replacement it chose |
+| --- | --- | --- |
+| overlap ≥ 0.45, 15% cheaper | 48% | ProBook 650 G2 for a ProBook 450 G7 |
+| overlap ≥ 0.90, 20% cheaper | 18% | a listing titled "Thinkpad" for a P52 workstation |
+| symmetric ≥ 0.75, 10% cheaper | ~0% | — |
+
+The loose rules retire half the market on replacements a person would reject
+at a glance. The strict rule almost never fires, and **that is the honest
+finding rather than a failure to tune**: what high title similarity actually
+turns up in this data is duplicates at the *same* price, which is
+bookkeeping and not a better deal. So supersession ships strict, and a
+"comparable" priced under a quarter of the listing it would replace is
+ignored outright — an RTX 3090 was posted at 1 EUR, and without that floor it
+would retire every real 3090 on the board.
+
 **Scheduling.** `track add` arms the next check with the sibling
 [`wake`][wake] CLI. Wake tasks are one-shot, so each run re-arms its own
 successor before it returns, always under the same task id (`track-<id>`) —

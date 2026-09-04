@@ -28,3 +28,28 @@ def completed(
     stdout: str, returncode: int = 0, stderr: str = ""
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+@pytest.fixture(autouse=True)
+def no_subprocesses(monkeypatch, request):
+    """No test may shell out. Ever.
+
+    This exists because a test did. Wiring the reaper into `run_assignment`
+    silently gave every engine test a real `claude -p` re-check scout: the
+    suite went from 0.85s to 39s and spent live model usage on a `pytest`
+    run, and nothing failed to say so. A stub in one fixture would have
+    fixed that one case; this fixes the class of it.
+
+    Tests that legitimately drive the subprocess boundary opt back in with
+    `@pytest.mark.subprocess`, and there should be very few of them.
+    """
+    if "subprocess" in request.keywords:
+        return
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            f"a test tried to run a subprocess: {args[0] if args else kwargs}. "
+            "Fake it, or mark the test with @pytest.mark.subprocess."
+        )
+
+    monkeypatch.setattr(subprocess, "run", forbidden)

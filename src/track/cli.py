@@ -43,7 +43,7 @@ from typing import NoReturn
 from . import __version__
 from .engine import RunOutcome, run_assignment, run_command
 from .errors import TrackError
-from .models import Assignment
+from .models import Assignment, Finding, ListingStatus
 from .scheduler import cancel as cancel_schedule
 from .scheduler import schedule as schedule_wakeup
 from .scoring import source_stats
@@ -198,6 +198,30 @@ def _money(price: float | None, currency: str | None = None) -> str:
     return f"{price:,.2f} {currency}" if currency else f"{price:,.2f}"
 
 
+def _provenance(finding: Finding, status: ListingStatus | None) -> str:
+    """The age line under a finding in `track show`.
+
+    Three different ages, deliberately not collapsed: how long we have known
+    about the listing, how long the advert has been up, and how old the
+    product is. A 2018 ThinkPad posted yesterday is a new advert for an old
+    machine, and none of the three implies the others.
+    """
+    parts = []
+    if status is not None:
+        parts.append(f"first seen {status.first_seen_at[:10]}")
+    if finding.listing_age_days is not None:
+        parts.append(f"listed {int(finding.listing_age_days)}d ago")
+    elif finding.listing_posted_at:
+        parts.append(f"listed {finding.listing_posted_at}")
+    if finding.product_year:
+        parts.append(f"{finding.product_year} model")
+    if finding.condition:
+        parts.append(finding.condition)
+    if status is not None:
+        parts.append(f"seen in {status.times_seen} run(s)")
+    return " · ".join(parts)
+
+
 def _run_exit_code(outcome: RunOutcome, *, posting: bool, log: Callable[[str], None]) -> int:
     if not posting:
         return 0 if outcome.usable else 1
@@ -334,6 +358,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 assignment = _require(store, args.assignment_id)
                 sources = store.list_sources(assignment.id)
                 best = store.best_findings(assignment.id, args.limit)
+                retired = store.retired_listings(assignment.id)
                 if args.json:
                     print(
                         json.dumps(
@@ -341,6 +366,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 "assignment": asdict(assignment),
                                 "sources": [asdict(s) for s in sources],
                                 "best": [asdict(f) for f in best],
+                                "retired": [asdict(s) for s in retired],
                                 "total_cost_usd": store.total_cost(assignment.id),
                             },
                             indent=2,
@@ -360,10 +386,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"best finds ({len(best)}):")
                 for f in best:
                     score = f"{f.score:.2f}" if f.score is not None else "?"
+                    basis = f" {f.score_basis}" if f.score_basis else ""
                     print(
                         f"  - {f.title} — {_money(f.price, f.currency)} @ {f.source} "
-                        f"(score {score}) {f.url or ''}".rstrip()
+                        f"(score {score}{basis}) {f.url or ''}".rstrip()
                     )
+                    if f.reference_price:
+                        print(
+                            f"      vs {_money(f.reference_price, f.currency)} from "
+                            f"{f.reference_n} comparable(s)"
+                        )
+                    if f.rationale:
+                        print(f"      {f.rationale}")
+                    provenance = _provenance(f, store.listing_status(assignment.id, f.dedup_key))
+                    if provenance:
+                        print(f"      {provenance}")
+                if retired:
+                    print(f"retired ({len(retired)}):")
+                    for status in retired[:args.limit]:
+                        note = f" — {status.retired_note}" if status.retired_note else ""
+                        print(f"  - [{status.retired_reason}] {status.dedup_key}{note}")
                 return 0
 
             if args.command == "sources":

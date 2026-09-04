@@ -238,7 +238,7 @@ def test_repair_splits_listings_that_shared_a_search_url(tmp_path: Path) -> None
                 dedup_key("KP", title, url), 0.5, True,
             )
         assert len(s.latest_findings(a.id)) == 1  # the bug, reproduced
-        s._conn.execute("DELETE FROM schema_meta WHERE name = 'repair_dedup_keys_v1'")
+        s._conn.execute("DELETE FROM schema_meta WHERE name LIKE 'repair_dedup_keys%'")
         s._conn.commit()
     with Store(db) as s:
         rows = s._conn.execute("SELECT count(*) c FROM findings").fetchone()["c"]
@@ -259,7 +259,7 @@ def test_repair_leaves_genuine_product_pages_merged(tmp_path: Path) -> None:
                 a.id, run, "Konovo", title, 54500.0, "RSD", url,
                 dedup_key("Konovo", title, url), 0.5, True,
             )
-        s._conn.execute("DELETE FROM schema_meta WHERE name = 'repair_dedup_keys_v1'")
+        s._conn.execute("DELETE FROM schema_meta WHERE name LIKE 'repair_dedup_keys%'")
         s._conn.commit()
     with Store(db) as s:
         assert len(s.latest_findings(a.id)) == 1
@@ -324,3 +324,63 @@ def test_the_view_shows_one_row_per_listing_not_per_sighting(store: Store) -> No
     rows = store._conn.execute("SELECT price FROM listings_current").fetchall()
 
     assert [r["price"] for r in rows] == [280.0]
+
+
+def test_a_key_repair_carries_listing_status_with_it(tmp_path: Path) -> None:
+    """Rewriting keys without this stranded 33 of 42 listings: their status
+    rows pointed at keys nothing referenced, so the reaper could not see them."""
+    db = tmp_path / "t.db"
+    url = "https://kp.com/graficke/pretraga?keywords=RTX+3060"
+    with Store(db) as s:
+        a = s.add_assignment("a gpu", 3600)
+        run = s.start_run(a.id)
+        for title in ("MSI RTX 3060", "ASUS RTX 3060"):
+            s.add_finding(
+                a.id, run, "KP", title, 245.0, "EUR", url,
+                dedup_key("KP", title, url), 0.5, True,
+            )
+        s._conn.execute("DELETE FROM schema_meta WHERE name LIKE 'repair_dedup_keys%'")
+        s._conn.commit()
+    with Store(db) as s:
+        keys = {f.dedup_key for f in s.latest_findings(a.id)}
+        assert len(keys) == 2
+        assert all(s.listing_status(a.id, key) is not None for key in keys)
+
+
+def test_a_key_repair_does_not_resurrect_a_retired_listing(tmp_path: Path) -> None:
+    db = tmp_path / "t.db"
+    with Store(db) as s:
+        a = s.add_assignment("a laptop", 3600)
+        key = dedup_key("KP", "ThinkPad T490", "https://kp/1")
+        s.add_finding(
+            a.id, s.start_run(a.id), "KP", "ThinkPad T490", 300.0, "EUR", "https://kp/1",
+            key, 0.5, True,
+        )
+        s.retire(a.id, key, reason="gone", note="sold")
+        s._conn.execute("DELETE FROM schema_meta WHERE name LIKE 'repair_dedup_keys%'")
+        s._conn.commit()
+    with Store(db) as s:
+        status = s.listing_status(a.id, key)
+        assert status.retired_reason == "gone"
+        assert status.retired_note == "sold"
+
+
+def test_status_rows_do_not_outlive_the_listings_they_describe(tmp_path: Path) -> None:
+    """A key rewrite leaves orphans, and they read as live listings to
+    anything querying the table rather than the view."""
+    db = tmp_path / "t.db"
+    with Store(db) as s:
+        a = s.add_assignment("a laptop", 3600)
+        _add(s, a.id, s.start_run(a.id), "k1", 300.0)
+        s._conn.execute(
+            "INSERT INTO listing_status (assignment_id, dedup_key, first_seen_at, "
+            "last_seen_at, times_seen) VALUES (?, 'stale', 't', 't', 1)",
+            (a.id,),
+        )
+        s._conn.commit()
+        assert s.listing_status(a.id, "stale") is not None
+        s._conn.execute("DELETE FROM schema_meta WHERE name LIKE 'backfill%'")
+        s._conn.commit()
+    with Store(db) as s:
+        assert s.listing_status(a.id, "stale") is None
+        assert s.listing_status(a.id, "k1") is not None
