@@ -16,6 +16,7 @@ import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from typing import Any, Protocol
 
 from .errors import ScoutError
@@ -95,6 +96,14 @@ class ScoutFinding:
     price: float | None
     currency: str | None
     url: str | None
+    # Provenance. All optional: a scout that cannot see one of these says so
+    # with a null rather than filling it in, and a listing is still worth
+    # recording without them.
+    rationale: str | None = None  # the scout's own reason, not a template
+    condition: str | None = None  # "used", "refurbished", "Grade B", ...
+    posted_at: str | None = None  # ISO date the seller posted it
+    age_days: float | None = None  # relative age, when there is no date
+    product_year: int | None = None  # the model's release year, not the ad's
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,9 +170,68 @@ approximate price from a search snippet is fine, and `null` is fine when no
 page will give one up. A handful of good-enough results beats one perfect
 one. Respond with ONLY a JSON array, no prose, no markdown fences:
 
-[{{"source": "<site or seller name>", "title": "<listing title>", "price": <number or null>, "currency": "<ISO code or null>", "url": "<listing url>"}}]
+[{{"source": "<site or seller name>", "title": "<listing title>", "price": <number or null>, "currency": "<ISO code or null>", "url": "<listing url>", "why": "<why this one is worth a look, one specific sentence>", "condition": "<new|used|refurbished|for parts|the grade the listing states|null>", "posted": "<YYYY-MM-DD the seller posted it, or null>", "age_days": <days since it was posted, or null>, "model_year": <the year this MODEL was released, not the year of the ad, or null>}}]
+
+Every field after `url` is optional and **`null` is the correct answer when
+the page does not say** -- do not spend a tool call establishing one and do
+not guess. `posted` and `age_days` are two spellings of the same fact:
+give whichever the site states and null for the other. `why` is the
+exception worth a sentence of thought: say what is actually notable about
+*this* listing -- the specification, the condition, how its price compares
+to the others you just saw -- not a restatement of the assignment. It is
+shown to a human deciding whether to open the link.
 
 Only listings you can actually see are live. At most 10, cheapest first."""
+
+
+# Provenance fields are advisory, so every one of these returns None rather
+# than raising: a scout that writes "unknown" into a date must not sink the
+# listing it was describing.
+
+_NON_ANSWERS = frozenset({"", "null", "none", "unknown", "n/a", "na", "-", "?"})
+
+
+def _text(value: Any, *, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.split())
+    if cleaned.lower() in _NON_ANSWERS:
+        return None
+    return cleaned[:limit] or None
+
+
+def _iso_date(value: Any) -> str | None:
+    """A YYYY-MM-DD the scout actually read off the page, or nothing.
+
+    Deliberately strict. A scout handed a relative age ("3 days ago") should
+    put it in `age_days`; accepting a loose date here would turn its guess at
+    the arithmetic into a stored fact.
+    """
+    text = _text(value, limit=10)
+    if text is None:
+        return None
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        return None
+
+
+def _positive_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if 0.0 <= number <= 40_000.0 else None
+
+
+def _year(value: Any) -> int | None:
+    """A plausible model year. 1990..next year, so a hallucinated 2050 or a
+    scout that answered with a price is dropped rather than stored."""
+    try:
+        year = int(value)
+    except (TypeError, ValueError):
+        return None
+    return year if 1990 <= year <= datetime.now(timezone.utc).year + 1 else None
 
 
 def _build_cmd(model: str, max_budget_usd: str) -> list[str]:
@@ -309,6 +377,11 @@ def scout_listings(
                 price=price,
                 currency=str(currency) if currency else None,
                 url=str(url) if url else None,
+                rationale=_text(item.get("why"), limit=400),
+                condition=_text(item.get("condition"), limit=60),
+                posted_at=_iso_date(item.get("posted")),
+                age_days=_positive_number(item.get("age_days")),
+                product_year=_year(item.get("model_year")),
             )
         )
     return ScoutResult(findings=findings, cost_usd=cost, blocked=blocked)

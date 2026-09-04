@@ -586,3 +586,48 @@ def test_an_unpriced_listing_gets_no_basis_at_all(store: Store, monkeypatch) -> 
 
     assert outcome.findings[0].score is None
     assert outcome.findings[0].score_basis is None
+
+
+# -- provenance ----------------------------------------------------------
+
+
+def test_a_run_keeps_the_scouts_reason_and_both_kinds_of_age(
+    store: Store, monkeypatch
+) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    store.upsert_source(a.id, "KP")
+    _fake_scouts(
+        monkeypatch,
+        [
+            ScoutFinding(
+                "KP", "Lenovo ThinkPad T490 i7 16GB", 230.0, "EUR", "https://kp/1",
+                rationale="Cheapest T490 with 512GB; three others sit at 280-300 EUR.",
+                condition="used", posted_at="2026-08-30", age_days=5.0, product_year=2019,
+            )
+        ],
+    )
+
+    stored = run_assignment(store, a).findings[0]
+
+    assert stored.rationale.startswith("Cheapest T490")
+    assert stored.condition == "used"
+    assert stored.listing_posted_at == "2026-08-30"
+    assert stored.listing_age_days == 5.0
+    assert stored.product_year == 2019
+
+
+def test_a_listing_seen_again_updates_its_status_without_losing_its_first_sighting(
+    store: Store, monkeypatch
+) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    store.upsert_source(a.id, "KP")
+    _fake_scouts(monkeypatch, [_sf("ThinkPad T490", 300.0, url="https://kp/1")])
+    run_assignment(store, a)
+    first = store.listing_status(a.id, store.latest_findings(a.id)[0].dedup_key)
+
+    _fake_scouts(monkeypatch, [_sf("ThinkPad T490", 280.0, url="https://kp/1")])
+    run_assignment(store, store.get_assignment(a.id))
+    later = store.listing_status(a.id, store.latest_findings(a.id)[0].dedup_key)
+
+    assert later.first_seen_at == first.first_seen_at
+    assert later.times_seen == 2

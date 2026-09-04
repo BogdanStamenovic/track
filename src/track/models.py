@@ -58,6 +58,39 @@ class Finding:
     reference_price: float | None = None
     reference_n: int | None = None
     score_basis: str | None = None
+    # Provenance, captured at scrape time. "How old is it" is two different
+    # questions and they are stored separately: `listing_posted_at` /
+    # `listing_age_days` are the *advert's* age, `product_year` is the
+    # *model's*. A 2018 ThinkPad posted yesterday is a new listing of an old
+    # machine, and a reader needs both to judge it.
+    rationale: str | None = None  # the scout's own words on why this one
+    condition: str | None = None
+    listing_posted_at: str | None = None
+    listing_age_days: float | None = None
+    product_year: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ListingStatus:
+    """What has become of one listing, as against what a run saw of it.
+
+    Kept apart from `findings` because findings are append-only sightings and
+    this is mutable state about *now*: how many times we have failed to reach
+    the page, and whether it has been retired. Folding it into the sighting
+    rows would mean rewriting history to record a fact about the present.
+    """
+
+    assignment_id: str
+    dedup_key: str
+    first_seen_at: str
+    last_seen_at: str
+    times_seen: int
+    last_checked_at: str | None = None
+    check_failures: int = 0
+    retired_at: str | None = None
+    retired_reason: str | None = None  # "gone" | "sold" | "superseded"
+    retired_note: str | None = None
+    superseded_by: str | None = None  # dedup_key of the listing that beat it
 
 
 @dataclass(frozen=True, slots=True)

@@ -7,6 +7,7 @@ cannot.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from typing import Any
 
@@ -290,3 +291,77 @@ def test_the_market_reaches_a_fanned_out_scout() -> None:
 
     assert len(seen) == 2
     assert all("MARKET: Serbia" in p for p in seen)
+
+
+# -- provenance ----------------------------------------------------------
+
+
+def _runner(stdout: str):
+    def runner(cmd: list[str], *, input: str | None, timeout: int):
+        return completed(stdout)
+
+    return runner
+
+
+def _one(payload: dict) -> ScoutFinding:
+    base = {"source": "KP", "title": "ThinkPad T490", "price": 230, "currency": "EUR",
+            "url": "https://kp/1"}
+    result = scout_listings(
+        "a laptop", "KP", runner=_runner(envelope(json.dumps([{**base, **payload}])))
+    )
+    return result.findings[0]
+
+
+def test_the_scouts_own_reason_is_kept_verbatim() -> None:
+    reason = "Cheapest T490 with 512GB on the site; three others at 280-300 EUR."
+    assert _one({"why": reason}).rationale == reason
+
+
+def test_condition_and_both_kinds_of_age_are_captured() -> None:
+    f = _one({"condition": "refurbished", "posted": "2026-08-30", "age_days": 5,
+              "model_year": 2019})
+    assert (f.condition, f.posted_at, f.age_days, f.product_year) == (
+        "refurbished", "2026-08-30", 5.0, 2019
+    )
+
+
+def test_missing_provenance_is_none_not_a_guess() -> None:
+    f = _one({})
+    assert (f.rationale, f.condition, f.posted_at, f.age_days, f.product_year) == (
+        None, None, None, None, None
+    )
+
+
+@pytest.mark.parametrize("value", ["unknown", "n/a", "null", "", "  ", "-"])
+def test_a_scout_writing_unknown_is_treated_as_no_answer(value: str) -> None:
+    assert _one({"condition": value}).condition is None
+
+
+def test_a_relative_age_in_the_date_field_is_refused() -> None:
+    """It belongs in age_days; accepting it here stores the scout's arithmetic
+    as though it were a date read off the page."""
+    assert _one({"posted": "3 days ago"}).posted_at is None
+
+
+def test_an_implausible_model_year_is_dropped() -> None:
+    assert _one({"model_year": 2050}).product_year is None
+    assert _one({"model_year": 1975}).product_year is None
+    assert _one({"model_year": "not a year"}).product_year is None
+
+
+def test_a_nonsense_age_is_dropped_rather_than_stored() -> None:
+    assert _one({"age_days": -4}).age_days is None
+    assert _one({"age_days": "soon"}).age_days is None
+
+
+def test_a_rationale_is_capped_rather_than_unbounded() -> None:
+    f = _one({"why": "x" * 5000})
+    assert f.rationale is not None
+    assert len(f.rationale) == 400
+
+
+def test_bad_provenance_does_not_cost_the_listing() -> None:
+    """The listing is the payload; the provenance is advisory."""
+    f = _one({"model_year": {"nested": "junk"}, "posted": 12345, "why": []})
+    assert f.title == "ThinkPad T490"
+    assert f.price == 230.0

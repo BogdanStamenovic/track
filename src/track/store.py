@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .errors import StoreError
-from .models import Assignment, Finding, Run, Source
+from .models import Assignment, Finding, ListingStatus, Run, Source
 from .scoring import dedup_key as _dedup_key
 from .scoring import index_url_bases as _index_url_bases
 
@@ -77,6 +77,21 @@ CREATE TABLE IF NOT EXISTS findings (
     found_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS listing_status (
+    assignment_id   TEXT NOT NULL,
+    dedup_key       TEXT NOT NULL,
+    first_seen_at   TEXT NOT NULL,
+    last_seen_at    TEXT NOT NULL,
+    times_seen      INTEGER NOT NULL DEFAULT 1,
+    last_checked_at TEXT,
+    check_failures  INTEGER NOT NULL DEFAULT 0,
+    retired_at      TEXT,
+    retired_reason  TEXT,
+    retired_note    TEXT,
+    superseded_by   TEXT,
+    PRIMARY KEY (assignment_id, dedup_key)
+);
+
 CREATE TABLE IF NOT EXISTS finding_comparables (
     finding_id INTEGER NOT NULL REFERENCES findings(id),
     peer_dedup_key TEXT NOT NULL,
@@ -99,6 +114,21 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 CREATE INDEX IF NOT EXISTS idx_findings_assignment ON findings(assignment_id);
 CREATE INDEX IF NOT EXISTS idx_findings_dedup ON findings(assignment_id, dedup_key);
 CREATE INDEX IF NOT EXISTS idx_runs_assignment ON runs(assignment_id);
+
+-- One row per distinct listing: its most recent sighting, joined to the
+-- state the reaper keeps. This is the contract anything outside track reads
+-- -- the tables under it are free to change shape, this is not. `f.*` is
+-- resolved when the view is queried rather than when it is created, so
+-- columns added to findings appear here without the view being rebuilt.
+CREATE VIEW IF NOT EXISTS listings_current AS
+SELECT f.*,
+       s.first_seen_at, s.last_seen_at, s.times_seen,
+       s.last_checked_at, s.check_failures,
+       s.retired_at, s.retired_reason, s.retired_note, s.superseded_by
+FROM findings f
+JOIN listing_status s
+  ON s.assignment_id = f.assignment_id AND s.dedup_key = f.dedup_key
+WHERE f.id IN (SELECT MAX(id) FROM findings GROUP BY assignment_id, dedup_key);
 """
 
 # Columns added after the first schema shipped. Applied with ADD COLUMN at
@@ -116,6 +146,11 @@ _ADDED_COLUMNS = [
     ("findings", "reference_price", "REAL"),
     ("findings", "reference_n", "INTEGER"),
     ("findings", "score_basis", "TEXT"),
+    ("findings", "rationale", "TEXT"),
+    ("findings", "condition", "TEXT"),
+    ("findings", "listing_posted_at", "TEXT"),
+    ("findings", "listing_age_days", "REAL"),
+    ("findings", "product_year", "INTEGER"),
 ]
 
 
@@ -140,6 +175,7 @@ class Store:
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._repair_dedup_keys()
+        self._backfill_listing_status()
         self._conn.commit()
 
     def _migrate(self) -> None:
@@ -193,6 +229,27 @@ class Store:
                 self._conn.execute(
                     "UPDATE findings SET dedup_key = ? WHERE id = ?", (key, row["id"])
                 )
+        self._mark_applied(name)
+
+    def _backfill_listing_status(self) -> None:
+        """Derive first/last seen and sighting counts from existing findings.
+
+        Runs after the dedup repair, never before: the repair changes which
+        rows belong to which listing, and a status table built on the old
+        keys would describe listings that no longer exist. "How old is this
+        listing" is answerable for every row already on record because
+        `found_at` was always there -- it just had nowhere to be read from.
+        """
+        name = "backfill_listing_status_v1"
+        if self._applied(name):
+            return
+        self._conn.execute(
+            "INSERT INTO listing_status "
+            "(assignment_id, dedup_key, first_seen_at, last_seen_at, times_seen) "
+            "SELECT assignment_id, dedup_key, MIN(found_at), MAX(found_at), COUNT(*) "
+            "FROM findings GROUP BY assignment_id, dedup_key "
+            "ON CONFLICT(assignment_id, dedup_key) DO NOTHING"
+        )
         self._mark_applied(name)
 
     # -- index urls ------------------------------------------------------
@@ -327,6 +384,9 @@ class Store:
         self._conn.execute("DELETE FROM runs WHERE assignment_id = ?", (assignment_id,))
         self._conn.execute("DELETE FROM sources WHERE assignment_id = ?", (assignment_id,))
         self._conn.execute("DELETE FROM index_urls WHERE assignment_id = ?", (assignment_id,))
+        self._conn.execute(
+            "DELETE FROM listing_status WHERE assignment_id = ?", (assignment_id,)
+        )
         self._conn.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
         self._conn.commit()
 
@@ -453,11 +513,17 @@ class Store:
         reference_n: int | None = None,
         score_basis: str | None = None,
         peers: Sequence[tuple[str, float]] = (),
+        rationale: str | None = None,
+        condition: str | None = None,
+        listing_posted_at: str | None = None,
+        listing_age_days: float | None = None,
+        product_year: int | None = None,
     ) -> Finding:
         cursor = self._conn.execute(
             "INSERT INTO findings (assignment_id, run_id, source, title, price, currency, "
             "url, dedup_key, score, is_new, found_at, reference_price, reference_n, "
-            "score_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "score_basis, rationale, condition, listing_posted_at, listing_age_days, "
+            "product_year) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 assignment_id,
                 run_id,
@@ -473,8 +539,14 @@ class Store:
                 reference_price,
                 reference_n,
                 score_basis,
+                rationale,
+                condition,
+                listing_posted_at,
+                listing_age_days,
+                product_year,
             ),
         )
+        self._touch_listing(assignment_id, dedup_key)
         if peers and cursor.lastrowid is not None:
             self._conn.executemany(
                 "INSERT OR REPLACE INTO finding_comparables "
@@ -493,6 +565,44 @@ class Store:
             "SELECT * FROM findings WHERE run_id = ? ORDER BY score DESC", (run_id,)
         ).fetchall()
         return [_row_to_finding(row) for row in rows]
+
+    def _touch_listing(self, assignment_id: str, dedup_key: str) -> None:
+        """Record that this listing was seen again, right now.
+
+        A sighting also un-retires: a listing the reaper had marked gone that
+        turns up alive in a later run is alive, and leaving the marking on it
+        would hide a real listing behind a stale verdict. The failure counter
+        resets for the same reason.
+        """
+        now = _now()
+        self._conn.execute(
+            "INSERT INTO listing_status (assignment_id, dedup_key, first_seen_at, "
+            "last_seen_at, times_seen) VALUES (?, ?, ?, ?, 1) "
+            "ON CONFLICT(assignment_id, dedup_key) DO UPDATE SET "
+            "last_seen_at = excluded.last_seen_at, times_seen = times_seen + 1, "
+            "check_failures = 0, retired_at = NULL, retired_reason = NULL, "
+            "retired_note = NULL, superseded_by = NULL",
+            (assignment_id, dedup_key, now, now),
+        )
+
+    def listing_status(self, assignment_id: str, dedup_key: str) -> ListingStatus | None:
+        row = self._conn.execute(
+            "SELECT * FROM listing_status WHERE assignment_id = ? AND dedup_key = ?",
+            (assignment_id, dedup_key),
+        ).fetchone()
+        return _row_to_listing_status(row) if row else None
+
+    def live_listings(self, assignment_id: str) -> list[Finding]:
+        """Latest sighting of every listing the reaper has not retired."""
+        retired = {
+            row["dedup_key"]
+            for row in self._conn.execute(
+                "SELECT dedup_key FROM listing_status WHERE assignment_id = ? "
+                "AND retired_at IS NOT NULL",
+                (assignment_id,),
+            ).fetchall()
+        }
+        return [f for f in self.latest_findings(assignment_id) if f.dedup_key not in retired]
 
     def comparables(self, finding_id: int) -> list[tuple[str, float]]:
         """The peer listings a finding's reference price was drawn from.
@@ -520,6 +630,22 @@ class Store:
             reverse=True,
         )
         return ranked[:limit]
+
+
+def _row_to_listing_status(row: sqlite3.Row) -> ListingStatus:
+    return ListingStatus(
+        assignment_id=row["assignment_id"],
+        dedup_key=row["dedup_key"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        times_seen=row["times_seen"],
+        last_checked_at=row["last_checked_at"],
+        check_failures=row["check_failures"],
+        retired_at=row["retired_at"],
+        retired_reason=row["retired_reason"],
+        retired_note=row["retired_note"],
+        superseded_by=row["superseded_by"],
+    )
 
 
 def _row_to_assignment(row: sqlite3.Row) -> Assignment:
@@ -586,4 +712,9 @@ def _row_to_finding(row: sqlite3.Row) -> Finding:
         reference_price=row["reference_price"],
         reference_n=row["reference_n"],
         score_basis=row["score_basis"],
+        rationale=row["rationale"],
+        condition=row["condition"],
+        listing_posted_at=row["listing_posted_at"],
+        listing_age_days=row["listing_age_days"],
+        product_year=row["product_year"],
     )

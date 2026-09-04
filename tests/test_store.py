@@ -264,3 +264,63 @@ def test_repair_leaves_genuine_product_pages_merged(tmp_path: Path) -> None:
     with Store(db) as s:
         assert len(s.latest_findings(a.id)) == 1
         assert s.index_url_bases(a.id) == set()
+
+
+# -- listing status ------------------------------------------------------
+
+
+def test_a_listing_records_when_it_was_first_and_last_seen(store: Store) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    for _ in range(3):
+        run = store.start_run(a.id)
+        _add(store, a.id, run, "k1", 300.0)
+
+    status = store.listing_status(a.id, "k1")
+    assert status is not None
+    assert status.times_seen == 3
+    assert status.first_seen_at <= status.last_seen_at
+
+
+def test_backfill_derives_listing_age_from_rows_that_predate_the_table(
+    tmp_path: Path,
+) -> None:
+    """found_at was always there; it just had nowhere to be read from."""
+    db = tmp_path / "t.db"
+    with Store(db) as s:
+        a = s.add_assignment("a laptop", 3600)
+        for _ in range(2):
+            _add(s, a.id, s.start_run(a.id), "k1", 300.0)
+        s._conn.execute("DELETE FROM listing_status")
+        s._conn.execute("DELETE FROM schema_meta WHERE name = 'backfill_listing_status_v1'")
+        s._conn.commit()
+    with Store(db) as s:
+        status = s.listing_status(a.id, "k1")
+        assert status is not None
+        assert status.times_seen == 2
+
+
+def test_the_listings_view_carries_provenance_and_status(store: Store) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    run = store.start_run(a.id)
+    store.add_finding(
+        a.id, run, "KP", "ThinkPad T490", 230.0, "EUR", "https://kp/1", "k1", 0.8, True,
+        rationale="cheapest T490 on the site", condition="used", product_year=2019,
+    )
+
+    rows = store._conn.execute("SELECT * FROM listings_current").fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["rationale"] == "cheapest T490 on the site"
+    assert rows[0]["product_year"] == 2019
+    assert rows[0]["times_seen"] == 1
+    assert rows[0]["retired_at"] is None
+
+
+def test_the_view_shows_one_row_per_listing_not_per_sighting(store: Store) -> None:
+    a = store.add_assignment("a laptop", 3600)
+    for price in (300.0, 280.0):
+        _add(store, a.id, store.start_run(a.id), "k1", price)
+
+    rows = store._conn.execute("SELECT price FROM listings_current").fetchall()
+
+    assert [r["price"] for r in rows] == [280.0]

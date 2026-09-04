@@ -183,11 +183,7 @@ def _body(new_findings: list[Finding]) -> list[str]:
         lines.append(f"_Tiers below are {currency} listings; other currencies follow._")
     for label, f in _tier(main_group):
         lines.append(f"**{label}** · {_money(f.price, f.currency)} — {f.title} @ {f.source}")
-        verdict = _verdict(f)
-        if verdict:
-            lines.append(f"  {verdict}")
-        if f.url:
-            lines.append(f"  <{f.url}>")
+        lines.extend(_detail(f))
 
     others = [f for f in new_findings if f not in main_group]
     if others:
@@ -195,6 +191,42 @@ def _body(new_findings: list[Finding]) -> list[str]:
         tag = f" in {', '.join(other_currencies)}" if other_currencies else ""
         lines.append(f"\nAlso new{tag} ({len(others)}), best first:")
         lines.extend(_ranked_lines(others, 3)[1:])
+    return lines
+
+
+def _age(f: Finding) -> str:
+    """The listing's age and the product's, which are different questions.
+
+    A 2018 ThinkPad posted yesterday is a new advert for an old machine, and
+    a 2024 machine that has sat unsold for three months is the opposite. Both
+    matter to someone deciding whether to open the link, and neither is
+    recoverable from the other.
+    """
+    parts = []
+    if f.listing_age_days is not None:
+        days = int(f.listing_age_days)
+        parts.append("listed today" if days < 1 else f"listed {days}d ago")
+    elif f.listing_posted_at:
+        parts.append(f"listed {f.listing_posted_at}")
+    if f.product_year:
+        parts.append(f"{f.product_year} model")
+    if f.condition:
+        parts.append(f.condition)
+    return " · ".join(parts)
+
+
+def _detail(f: Finding) -> list[str]:
+    """The lines under a listing: why, how old, and the link."""
+    lines = []
+    if f.rationale:
+        lines.append(f"  _{f.rationale}_")
+    verdict = _verdict(f)
+    age = _age(f)
+    tail = " · ".join(x for x in (verdict, age) if x)
+    if tail:
+        lines.append(f"  {tail}")
+    if f.url:
+        lines.append(f"  <{f.url}>")
     return lines
 
 
@@ -226,11 +258,7 @@ def _ranked_lines(findings: list[Finding], limit: int) -> list[str]:
     lines = [""]
     for f in ranked[:limit]:
         lines.append(f"• **{f.title}** — {_money(f.price, f.currency)} @ {f.source}")
-        verdict = _verdict(f)
-        if verdict:
-            lines.append(f"  {verdict}")
-        if f.url:
-            lines.append(f"  <{f.url}>")
+        lines.extend(_detail(f))
     if len(ranked) > limit:
         lines.append(f"…and {len(ranked) - limit} more.")
     return lines

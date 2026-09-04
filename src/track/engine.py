@@ -258,6 +258,11 @@ def run_assignment(
                 reference_n=reference.n if reference else None,
                 score_basis=basis,
                 peers=reference.peers if reference else (),
+                rationale=raw.rationale,
+                condition=raw.condition,
+                listing_posted_at=raw.posted_at,
+                listing_age_days=raw.age_days,
+                product_year=raw.product_year,
             )
         )
         store.upsert_source(assignment.id, raw.source, raw.url)
