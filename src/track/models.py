@@ -52,6 +52,12 @@ class Finding:
     score: float | None
     is_new: bool
     found_at: str
+    # Why the score is what it is. `score_basis` is "mispricing" when a
+    # comparable was found and "cheapness" when the score fell back to a
+    # percentile of everything on record, which is a much weaker claim.
+    reference_price: float | None = None
+    reference_n: int | None = None
+    score_basis: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

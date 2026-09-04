@@ -174,6 +174,9 @@ def _body(new_findings: list[Finding]) -> list[str]:
         lines.append(f"_Tiers below are {currency} listings; other currencies follow._")
     for label, f in _tier(main_group):
         lines.append(f"**{label}** · {_money(f.price, f.currency)} — {f.title} @ {f.source}")
+        verdict = _verdict(f)
+        if verdict:
+            lines.append(f"  {verdict}")
         if f.url:
             lines.append(f"  <{f.url}>")
 
@@ -186,12 +189,37 @@ def _body(new_findings: list[Finding]) -> list[str]:
     return lines
 
 
+def _verdict(f: Finding) -> str:
+    """What the score is claiming, and on what evidence.
+
+    A bare "score 0.62" is unreadable without knowing what it was measured
+    against, and the two bases mean very different things: one says "this is
+    23% under what four other listings of the same card are asking", the
+    other only says "this is a small number compared to everything we have
+    seen". Both belong in the report; conflating them does not.
+    """
+    if f.score is None:
+        return ""
+    if f.score_basis == "mispricing" and f.reference_price:
+        peers = f.reference_n or 0
+        gap = (f.reference_price - (f.price or 0.0)) / f.reference_price
+        direction = "under" if gap >= 0 else "over"
+        return (
+            f"score {f.score:.2f} — **{abs(gap):.0%} {direction}** the "
+            f"{_money(f.reference_price, f.currency)} that {peers} comparable "
+            f"listing{'s' if peers != 1 else ''} ask"
+        )
+    return f"score {f.score:.2f} — _no comparable found; ranked on price alone_"
+
+
 def _ranked_lines(findings: list[Finding], limit: int) -> list[str]:
     ranked = sorted(findings, key=lambda f: (f.score if f.score is not None else -1.0), reverse=True)
     lines = [""]
     for f in ranked[:limit]:
-        score_tag = f" · score {f.score:.2f}" if f.score is not None else ""
-        lines.append(f"• **{f.title}** — {_money(f.price, f.currency)} @ {f.source}{score_tag}")
+        lines.append(f"• **{f.title}** — {_money(f.price, f.currency)} @ {f.source}")
+        verdict = _verdict(f)
+        if verdict:
+            lines.append(f"  {verdict}")
         if f.url:
             lines.append(f"  <{f.url}>")
     if len(ranked) > limit:

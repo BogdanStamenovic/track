@@ -1,7 +1,19 @@
 from __future__ import annotations
 
+import pytest
+
 from track.models import Finding
-from track.scoring import dedup_key, index_url_bases, source_stats, underpriced_score
+from track.scoring import (
+    MAX_PEERS_RECORDED,
+    Comparable,
+    Market,
+    Reference,
+    dedup_key,
+    index_url_bases,
+    mispricing_score,
+    source_stats,
+    underpriced_score,
+)
 
 
 def _finding(
@@ -185,3 +197,138 @@ def test_a_product_url_still_outranks_a_retitled_listing() -> None:
     assert dedup_key("Konovo", "HP EliteBook 855 G8 (Grade C)", url) == dedup_key(
         "Konovo", "HP EliteBook 855 G8 - Grade C, 16GB RAM", url
     )
+
+
+# -- comparables and mispricing ------------------------------------------
+
+
+def _market(*listings: tuple[str, str, float, str]) -> Market:
+    return Market(Comparable(k, t, p, c) for k, t, p, c in listings)
+
+
+GPUS = (
+    ("a", "MSI GeForce RTX 3060 12GB VENTUS 2X", 245.0, "EUR"),
+    ("b", "RTX 3060 12GB ASUS DUAL", 300.0, "EUR"),
+    ("c", "ASUS PH-RTX3060-12G-V2", 310.0, "EUR"),
+    ("d", "ASUS Dual-Rtx3060-O12G-V2", 440.0, "EUR"),
+    ("e", "RTX 3090 24GB Gigabyte Gaming OC", 1100.0, "EUR"),
+    ("f", "RTX 3090 Zotac Trinity 24GB", 1100.0, "EUR"),
+)
+
+
+def test_a_listing_under_its_comparables_scores_above_neutral() -> None:
+    market = _market(*GPUS)
+    ref = market.reference("new", "Nvidia RTX 3060 12GB", "EUR")
+    assert ref is not None
+    assert mispricing_score(230.0, ref) > 0.5
+
+
+def test_a_listing_over_its_comparables_scores_below_neutral() -> None:
+    market = _market(*GPUS)
+    ref = market.reference("new", "Nvidia RTX 3060 12GB", "EUR")
+    assert ref is not None
+    assert mispricing_score(600.0, ref) < 0.5
+
+
+def test_the_going_rate_scores_neutral() -> None:
+    market = _market(*GPUS)
+    ref = market.reference("new", "RTX 3090 24GB Gigabyte Gaming OC", "EUR")
+    assert ref is not None
+    assert mispricing_score(ref.price, ref) == 0.5
+
+
+def test_a_dear_listing_can_outscore_a_cheap_one() -> None:
+    """The whole point: 1100 EUR can be the better buy than 440 EUR."""
+    market = _market(*GPUS)
+    dear = market.reference("x", "RTX 3090 24GB Palit", "EUR")
+    cheap = market.reference("y", "RTX 3060 12GB Palit", "EUR")
+    assert dear is not None and cheap is not None
+    assert mispricing_score(700.0, dear) > mispricing_score(440.0, cheap)
+
+
+def test_a_terse_model_code_still_finds_its_comparables() -> None:
+    """PH-RTX3060-12G-V2 shares nothing with "RTX 3060 12GB" un-split."""
+    market = _market(*GPUS)
+    ref = market.reference("new", "ASUS PH-RTX3060-12G-V2", "EUR")
+    assert ref is not None
+    assert "d" in {key for key, _ in ref.peers}
+
+
+def test_a_verbose_title_still_finds_its_comparables() -> None:
+    """Jaccard lost this one: the commentary inflates the union."""
+    market = _market(*GPUS)
+    ref = market.reference(
+        "new",
+        "Nvidia RTX 3060 12GB (appears underpriced vs other 3060 12GB listings, EUR 245-440)",
+        "EUR",
+    )
+    assert ref is not None
+    assert ref.n >= 1
+
+
+def test_another_model_class_is_not_a_comparable() -> None:
+    """An RTX 3090 says nothing about what an RTX 3060 is worth."""
+    market = _market(*GPUS)
+    ref = market.reference("new", "MSI RTX 3060 12GB", "EUR")
+    assert ref is not None
+    assert {"e", "f"}.isdisjoint({key for key, _ in ref.peers})
+
+
+def test_a_dearer_model_class_arriving_does_not_move_the_score() -> None:
+    """Cheapness moves by up to 0.21 here; a valuation must not move at all."""
+    listing = ("new", "MSI RTX 3060 12GB", 230.0, "EUR")
+    before = _market(*GPUS).reference(*(listing[0], listing[1], listing[3]))
+    flooded = _market(
+        *GPUS, *[(f"g{i}", "RTX 3090 24GB Gigabyte Gaming OC", 2000.0, "EUR") for i in range(10)]
+    )
+    after = flooded.reference(listing[0], listing[1], listing[3])
+    assert before is not None and after is not None
+    assert mispricing_score(230.0, before) == mispricing_score(230.0, after)
+
+
+def test_prices_in_another_currency_are_never_comparables() -> None:
+    market = _market(
+        ("a", "MSI GeForce RTX 3060 12GB VENTUS 2X", 245.0, "EUR"),
+        ("b", "MSI GeForce RTX 3060 12GB VENTUS 2X", 56519.0, "RSD"),
+    )
+    ref = market.reference("new", "MSI GeForce RTX 3060 12GB VENTUS 2X", "RSD")
+    assert ref is not None
+    assert [key for key, _ in ref.peers] == ["b"]
+
+
+def test_a_listing_is_never_its_own_comparable() -> None:
+    market = _market(("a", "MSI GeForce RTX 3060 12GB VENTUS 2X", 245.0, "EUR"))
+    assert market.reference("a", "MSI GeForce RTX 3060 12GB VENTUS 2X", "EUR") is None
+
+
+def test_nothing_comparable_yields_no_reference_rather_than_a_bad_one() -> None:
+    market = _market(*GPUS)
+    assert market.reference("new", "Bosch dishwasher SMS46KI03E", "EUR") is None
+
+
+def test_one_peer_is_trusted_less_than_several() -> None:
+    """A reference nobody corroborates states half of what it saw."""
+    one = Reference(price=100.0, peers=(("a", 0.9),))
+    many = Reference(price=100.0, peers=tuple((str(i), 0.9) for i in range(9)))
+    assert mispricing_score(50.0, one) < mispricing_score(50.0, many)
+    assert mispricing_score(50.0, many) == pytest.approx(0.95)
+
+
+def test_the_score_stays_inside_its_range() -> None:
+    ref = Reference(price=100.0, peers=tuple((str(i), 0.9) for i in range(9)))
+    assert mispricing_score(0.01, ref) <= 1.0
+    assert mispricing_score(100_000.0, ref) >= 0.0
+
+
+def test_a_free_reference_price_is_not_a_valuation() -> None:
+    assert mispricing_score(10.0, Reference(price=0.0, peers=(("a", 1.0),))) == 0.5
+
+
+def test_only_the_closest_peers_are_recorded() -> None:
+    market = _market(
+        *[(f"p{i}", "MSI GeForce RTX 3060 12GB VENTUS 2X", 245.0 + i, "EUR") for i in range(20)]
+    )
+    ref = market.reference("new", "MSI GeForce RTX 3060 12GB VENTUS 2X", "EUR")
+    assert ref is not None
+    assert ref.n == MAX_PEERS_RECORDED
+    assert list(ref.peers) == sorted(ref.peers, key=lambda p: -p[1])

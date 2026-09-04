@@ -507,3 +507,82 @@ def test_an_index_url_stays_classified_when_a_later_run_returns_one_hit(
 
     assert [f.is_new for f in second.findings] == [False]
     assert len(store.latest_findings(a.id)) == 2
+
+
+# -- mispricing ----------------------------------------------------------
+
+
+def test_comparables_arriving_in_the_same_run_still_separate_them(
+    store: Store, monkeypatch
+) -> None:
+    """Five of one card in the first run of a new assignment: the case that
+    scored a flat 0.50 for all five before comparables existed."""
+    a = store.add_assignment("a gpu", 3600)
+    store.upsert_source(a.id, "KP")
+    prices = [230.0, 245.0, 300.0, 310.0, 440.0]
+    _fake_scouts(
+        monkeypatch,
+        [
+            ScoutFinding("KP", f"MSI GeForce RTX 3060 12GB model {i}", p, "EUR", f"https://x/{i}")
+            for i, p in enumerate(prices)
+        ],
+    )
+
+    outcome = run_assignment(store, a)
+
+    by_price = {f.price: f for f in outcome.findings}
+    assert all(f.score_basis == "mispricing" for f in outcome.findings)
+    assert by_price[230.0].score > by_price[440.0].score
+    assert len({f.score for f in outcome.findings}) == len(prices)
+
+
+def test_a_finding_records_the_reference_it_was_judged_against(
+    store: Store, monkeypatch
+) -> None:
+    a = store.add_assignment("a gpu", 3600)
+    store.upsert_source(a.id, "KP")
+    _fake_scouts(
+        monkeypatch,
+        [
+            ScoutFinding("KP", "MSI GeForce RTX 3060 12GB VENTUS", 300.0, "EUR", "https://x/1"),
+            ScoutFinding("KP", "ASUS GeForce RTX 3060 12GB VENTUS", 230.0, "EUR", "https://x/2"),
+        ],
+    )
+
+    outcome = run_assignment(store, a)
+
+    cheap = min(outcome.findings, key=lambda f: f.price or 0)
+    assert cheap.reference_price == 300.0
+    assert cheap.reference_n == 1
+    assert store.comparables(cheap.id) != []
+
+
+def test_a_listing_with_no_comparable_still_ranks(store: Store, monkeypatch) -> None:
+    """Degraded, not dropped -- and it says so."""
+    a = store.add_assignment("a gpu", 3600)
+    store.upsert_source(a.id, "KP")
+    _fake_scouts(
+        monkeypatch,
+        [
+            ScoutFinding("KP", "MSI GeForce RTX 3060 12GB", 300.0, "EUR", "https://x/1"),
+            ScoutFinding("KP", "Bosch dishwasher SMS46KI03E", 210.0, "EUR", "https://x/2"),
+        ],
+    )
+
+    outcome = run_assignment(store, a)
+
+    odd = next(f for f in outcome.findings if "Bosch" in f.title)
+    assert odd.score is not None
+    assert odd.score_basis == "cheapness"
+    assert odd.reference_price is None
+
+
+def test_an_unpriced_listing_gets_no_basis_at_all(store: Store, monkeypatch) -> None:
+    a = store.add_assignment("a gpu", 3600)
+    store.upsert_source(a.id, "KP")
+    _fake_scouts(monkeypatch, [ScoutFinding("KP", "MSI RTX 3060 12GB", None, None, "https://x/1")])
+
+    outcome = run_assignment(store, a)
+
+    assert outcome.findings[0].score is None
+    assert outcome.findings[0].score_basis is None

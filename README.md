@@ -140,11 +140,69 @@ numerically smaller than every RSD price on record. Source statistics are
 keyed by source *and* currency for the same reason — a median taken across two
 currencies describes nothing.
 
-**Scoring.** A finding's score is the share of the assignment's known prices it
-undercuts: `1.00` is cheaper than everything on record, `0.50` means there was
-no history to judge against yet. The history is snapshotted once at the start
-of a run and not extended while that run scores, so two identical runs cannot
-disagree just because their scouts returned in a different order.
+**Scoring is about mispricing, not cheapness.** A finding's score answers "is
+this priced below what this thing actually goes for", which needs a reference
+price for the *comparable* rather than a ranking of every number the
+assignment has ever seen. `0.50` means priced at the going rate, above means
+under it, below means over it; the score is linear in the discount, so `0.80`
+is thirty percent under and `1.00` is half price or better.
+
+The reference is the median asking price of the listing's comparables — other
+listings in the same currency whose titles share enough distinctive weight to
+be the same thing. Similarity is IDF-weighted containment: shared weight over
+the *shorter* title, so a terse `ASUS PH-RTX3060-12G-V2` and a chatty `Nvidia
+RTX 3060 12GB (appears underpriced vs other 3060 12GB listings, EUR 245-440)`
+still recognise each other. The deviation is weighted `n/(n+1)`, so a
+reference nobody corroborates states half of what it saw.
+
+The market is snapshotted once at the start of a run and not extended while
+that run scores, so two identical runs cannot disagree just because their
+scouts returned in a different order. It spans the assignment's history *and*
+the whole of the current run's haul, because comparables usually arrive
+together: five RTX 3060s priced 230 to 440 EUR turned up in one run of a
+brand-new assignment, and against history alone there was nothing to compare
+them with.
+
+**No comparable means a degraded score, not a missing one.** A listing with
+nothing to compare against falls back to the old measure — the share of known
+prices it undercuts — and is marked `score_basis = 'cheapness'` so the weaker
+claim is visible rather than blended in. That happens for about 7% of priced
+listings on the data this was tuned against.
+
+**What the change is worth, measured on 152 priced listings:**
+
+| | cheapness (old) | mispricing (new) |
+| --- | --- | --- |
+| listings with a real comparable | 0% | 92.8% |
+| correlation of score with raw price | −0.546 | **+0.011** |
+| correlation with 29 hand-verified comparable discounts | +0.777 | **+0.871** |
+
+The middle row is the one that matters and it needs no labels: a cheapness
+percentile is very nearly a restatement of "small number", and a valuation
+should be near zero there, because an expensive thing can be the better deal.
+The third row is a check rather than a verdict — 29 listings in six groups
+that a human confirmed are the same thing, scored against their own
+leave-one-out median.
+
+The other label-free test is stability. Injecting twelve more RTX 3090
+listings says nothing whatsoever about what an RTX 3060 is worth, so nothing
+about a 3060's valuation should move:
+
+```
+                        230     245     300     310     440 EUR
+cheapness         0.92->0.96  ->0.92  ->0.88  ->0.83  0.58->0.79
+mispricing        0.62->0.62  ->0.59  ->0.44  ->0.61  0.20->0.20
+```
+
+Cheapness moves every one of them, and the *worst* deal in the class climbs
+from 0.58 to 0.79 because unrelated dearer cards arrived. Across all 152
+listings the largest drift is 0.43 for cheapness and 0.19 for mispricing.
+
+On real data the biggest single mover was an HP ZBook Power 15 G10
+(i7-13700H, 1TB, RTX 3000) at 327,860 RSD, **0.10 → 0.66** — an expensive
+machine that is cheap for what it is, which the old score buried for being a
+big number. In the other direction a 220 EUR Acer Aspire went 0.91 → 0.26:
+cheap in absolute terms, dear for an Aspire.
 
 **Findings are append-only.** A run never rewrites or rescores an earlier one.
 A listing seen five times has five rows, which is how a price drop is visible
@@ -289,9 +347,30 @@ from deploying it that way, rather than assumptions:
   to route around it.
 - **Scout quality is whatever the open web will give a read-only session.**
   There is no marketplace API access, no private inventory feed, no login.
-- **Scores are relative, not absolute.** `1.00` means "cheapest this
-  assignment has ever seen", which on a young assignment with three data
-  points means very little. It is a ranking signal, not a valuation.
+- **The reference price is what other sellers are asking, not what anything
+  sold for.** There is no sold-price feed, so an entire category listed
+  optimistically reads as fairly priced. It measures dispersion within a
+  market, not the market's level.
+- **Comparables need a corpus.** Below roughly fourteen listings the
+  similarity weights have too little to work with: sampling the GPU
+  assignment down to six listings, only 59% of a known comparable group still
+  found each other, against 98% at twenty. New assignments therefore lean on
+  the cheapness fallback for their first run or two.
+- **A reference from one peer is one seller's opinion.** `reference_n` says
+  how many backed it and the score is weighted accordingly, but `n = 1` is
+  common and it is a weak reference, not a market rate.
+- **Nothing filters out a listing error.** An RTX 3090 posted at 1 EUR scores
+  1.00, correctly by the arithmetic and uselessly in fact. The reference price
+  is shown next to it so a human can see what happened; there is no
+  too-good-to-be-true rule, because one that suppressed this would also
+  suppress a genuine steal.
+- **A scout is not a price oracle, measured.** Asked directly what six known
+  items go for, one Sonnet scout was within 1.4% and 0.4% on the two it
+  actually looked up and off by −37%, −41% and +39% on the three it answered
+  from general knowledge after spending its three-call budget, and returned
+  `null` for the sixth. Median absolute error 37%, against a bargain signal of
+  20–35% — the instrument's error is larger than what it would measure, so
+  scout-quoted reference prices are deliberately not used.
 - **A run consumes whatever `claude` is authenticated with.** On an API key
   that is billable credit; on a Claude subscription it draws down the plan's
   usage allowance and bills nothing. Either way the figure track records is

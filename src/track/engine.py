@@ -7,10 +7,12 @@ returning, since wake tasks are one-shot (see scheduler.py). A
 
 Two ordering rules that the correctness of the scores depends on:
 
-* The price history is snapshotted once, before any finding is scored, and
-  not extended during the run. Scoring against a history that grows as the
-  run proceeds would make a finding's score depend on which scout happened
-  to return first, so two identical runs could disagree.
+* The market a finding is scored against is snapshotted once, before any
+  finding is scored, and not extended during the run. Scoring against a
+  snapshot that grows as the run proceeds would make a finding's score depend
+  on which scout happened to return first, so two identical runs could
+  disagree. The snapshot spans the assignment's history *and* the whole of
+  this run's haul, because comparables often arrive together.
 * Findings are only ever appended. A run scores its own findings against the
   history that existed when it started and never touches an earlier row, so
   history means "what this looked like at the time", permanently.
@@ -28,7 +30,15 @@ from . import scheduler, scouts
 from .errors import TrackError
 from .models import Assignment, Finding, SourceStat
 from .report import build_summary, post_summary
-from .scoring import dedup_key, index_url_bases, source_stats, underpriced_score
+from .scoring import (
+    Comparable,
+    Market,
+    dedup_key,
+    index_url_bases,
+    mispricing_score,
+    source_stats,
+    underpriced_score,
+)
 from .store import Store
 
 DEFAULT_SOURCE_LIMIT = 5
@@ -190,18 +200,48 @@ def run_assignment(
         )
     index_bases = known_index | fresh_index
 
-    # Frozen for the whole run, on purpose, and keyed by currency: a finding
-    # is scored only against others quoted in the same one.
-    history = store.price_history(assignment.id)
-    stored: list[Finding] = []
-    for raw in scouted.findings:
-        key = dedup_key(raw.source, raw.title, raw.url, index_bases)
-        is_new = not store.has_seen(assignment.id, key)
-        score = (
-            underpriced_score(raw.price, history.get(raw.currency, []))
+    keys = [dedup_key(raw.source, raw.title, raw.url, index_bases) for raw in scouted.findings]
+
+    # Both snapshots are taken before anything is scored and not extended
+    # while the run proceeds, so two identical runs cannot disagree because
+    # their scouts returned in a different order.
+    #
+    # The market deliberately includes this run's own haul as well as the
+    # history. Five RTX 3060s priced 230 to 440 EUR arrived together in the
+    # first run of a brand-new assignment: against history alone there was
+    # nothing to compare them with and all five scored the no-history 0.50,
+    # which is the failure this whole scoring change exists to fix.
+    market = Market(
+        [
+            Comparable(f.dedup_key, f.title, f.price, f.currency)
+            for f in store.latest_findings(assignment.id)
+            if f.price is not None
+        ]
+        + [
+            Comparable(key, raw.title, raw.price, raw.currency)
+            for key, raw in zip(keys, scouted.findings, strict=True)
             if raw.price is not None
-            else None
-        )
+        ]
+    )
+    # Kept for the fallback: a listing with no comparable still ranks, on the
+    # weaker "cheaper than most of what we have seen" question, rather than
+    # dropping out of the report entirely.
+    history = store.price_history(assignment.id)
+
+    stored: list[Finding] = []
+    for key, raw in zip(keys, scouted.findings, strict=True):
+        is_new = not store.has_seen(assignment.id, key)
+        score: float | None = None
+        reference = None
+        basis: str | None = None
+        if raw.price is not None:
+            reference = market.reference(key, raw.title, raw.currency)
+            if reference is not None:
+                score = mispricing_score(raw.price, reference)
+                basis = "mispricing"
+            else:
+                score = underpriced_score(raw.price, history.get(raw.currency, []))
+                basis = "cheapness"
         stored.append(
             store.add_finding(
                 assignment.id,
@@ -214,6 +254,10 @@ def run_assignment(
                 key,
                 score,
                 is_new,
+                reference_price=reference.price if reference else None,
+                reference_n=reference.n if reference else None,
+                score_basis=basis,
+                peers=reference.peers if reference else (),
             )
         )
         store.upsert_source(assignment.id, raw.source, raw.url)

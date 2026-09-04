@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -76,6 +77,13 @@ CREATE TABLE IF NOT EXISTS findings (
     found_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS finding_comparables (
+    finding_id INTEGER NOT NULL REFERENCES findings(id),
+    peer_dedup_key TEXT NOT NULL,
+    similarity REAL NOT NULL,
+    PRIMARY KEY (finding_id, peer_dedup_key)
+);
+
 CREATE TABLE IF NOT EXISTS index_urls (
     assignment_id TEXT NOT NULL,
     url_basis TEXT NOT NULL,
@@ -105,6 +113,9 @@ _ADDED_COLUMNS = [
     ("assignments", "resume_job_id", "TEXT"),
     ("assignments", "runs_count", "INTEGER NOT NULL DEFAULT 0"),
     ("runs", "cost_usd", "REAL NOT NULL DEFAULT 0"),
+    ("findings", "reference_price", "REAL"),
+    ("findings", "reference_n", "INTEGER"),
+    ("findings", "score_basis", "TEXT"),
 ]
 
 
@@ -307,6 +318,11 @@ class Store:
         self._conn.commit()
 
     def remove_assignment(self, assignment_id: str) -> None:
+        self._conn.execute(
+            "DELETE FROM finding_comparables WHERE finding_id IN "
+            "(SELECT id FROM findings WHERE assignment_id = ?)",
+            (assignment_id,),
+        )
         self._conn.execute("DELETE FROM findings WHERE assignment_id = ?", (assignment_id,))
         self._conn.execute("DELETE FROM runs WHERE assignment_id = ?", (assignment_id,))
         self._conn.execute("DELETE FROM sources WHERE assignment_id = ?", (assignment_id,))
@@ -432,10 +448,16 @@ class Store:
         dedup_key: str,
         score: float | None,
         is_new: bool,
+        *,
+        reference_price: float | None = None,
+        reference_n: int | None = None,
+        score_basis: str | None = None,
+        peers: Sequence[tuple[str, float]] = (),
     ) -> Finding:
         cursor = self._conn.execute(
             "INSERT INTO findings (assignment_id, run_id, source, title, price, currency, "
-            "url, dedup_key, score, is_new, found_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "url, dedup_key, score, is_new, found_at, reference_price, reference_n, "
+            "score_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 assignment_id,
                 run_id,
@@ -448,8 +470,17 @@ class Store:
                 score,
                 int(is_new),
                 _now(),
+                reference_price,
+                reference_n,
+                score_basis,
             ),
         )
+        if peers and cursor.lastrowid is not None:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO finding_comparables "
+                "(finding_id, peer_dedup_key, similarity) VALUES (?, ?, ?)",
+                [(cursor.lastrowid, key, sim) for key, sim in peers],
+            )
         self._conn.commit()
         finding_id = cursor.lastrowid
         if finding_id is None:
@@ -462,6 +493,20 @@ class Store:
             "SELECT * FROM findings WHERE run_id = ? ORDER BY score DESC", (run_id,)
         ).fetchall()
         return [_row_to_finding(row) for row in rows]
+
+    def comparables(self, finding_id: int) -> list[tuple[str, float]]:
+        """The peer listings a finding's reference price was drawn from.
+
+        This is the evidence behind "why was this recommended": not a
+        template, the actual other listings of the same thing and what they
+        were asking.
+        """
+        rows = self._conn.execute(
+            "SELECT peer_dedup_key, similarity FROM finding_comparables "
+            "WHERE finding_id = ? ORDER BY similarity DESC",
+            (finding_id,),
+        ).fetchall()
+        return [(row["peer_dedup_key"], row["similarity"]) for row in rows]
 
     def best_findings(self, assignment_id: str, limit: int = 5) -> list[Finding]:
         """Top listings by score, one entry per listing.
@@ -538,4 +583,7 @@ def _row_to_finding(row: sqlite3.Row) -> Finding:
         score=row["score"],
         is_new=bool(row["is_new"]),
         found_at=row["found_at"],
+        reference_price=row["reference_price"],
+        reference_n=row["reference_n"],
+        score_basis=row["score_basis"],
     )
