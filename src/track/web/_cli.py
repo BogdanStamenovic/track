@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import threading
@@ -28,6 +29,28 @@ from .data import DEFAULT_DB_PATH, Summary, WebError, connect, read_schema, summ
 from .server import Config, gaps_for, serve, tailnet_address
 
 DEFAULT_PORT = 8791
+
+#: Read when the corresponding flag is absent. They exist so the systemd unit can
+#: be configured through an EnvironmentFile instead of a rewritten ExecStart --
+#: `track web serve` with no arguments has to be the whole command line, or the
+#: installer would be editing a unit file every time a port changes.
+PORT_ENV = "TRACK_WEB_PORT"
+HOSTS_ENV = "TRACK_WEB_HOSTS"
+
+
+def _env_port() -> int | None:
+    raw = os.environ.get(PORT_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _env_hosts() -> list[str]:
+    raw = os.environ.get(HOSTS_ENV, "")
+    return [h for h in raw.replace(",", " ").split() if h]
 
 
 class _UsageError(Exception):
@@ -66,10 +89,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--host",
         action="append",
         metavar="ADDR",
-        help="address to bind; repeatable. Default: 127.0.0.1 plus this host's "
-        "tailnet address if it has one. Never binds a wildcard implicitly.",
+        help=f"address to bind; repeatable. Default: ${HOSTS_ENV} if set, else "
+        "127.0.0.1 plus this host's tailnet address if it has one. Never binds a "
+        "wildcard implicitly.",
     )
-    srv.add_argument("-p", "--port", type=int, default=DEFAULT_PORT, help=f"port (default {DEFAULT_PORT})")
+    srv.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        default=None,
+        help=f"port (default: ${PORT_ENV}, else {DEFAULT_PORT})",
+    )
 
     inf = subs.add_parser(
         "info",
@@ -162,7 +192,7 @@ def main(
                 _print_info(data)
             return 0
 
-        explicit = list(getattr(args, "host", None) or [])
+        explicit = list(getattr(args, "host", None) or []) or _env_hosts()
         hosts = list(explicit)
         discover = None
         if not hosts:
@@ -180,7 +210,7 @@ def main(
         # Fail here rather than after binding, so a bad path is a clean error.
         connect(args.db).close()
 
-        port = getattr(args, "port", DEFAULT_PORT)
+        port = getattr(args, "port", None) or _env_port() or DEFAULT_PORT
         servers = serve(Config(db_path=args.db, log=say), hosts, port, discover=discover)
         say(f"track web {__version__} serving {args.db}")
         for server in servers:

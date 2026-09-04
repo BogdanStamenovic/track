@@ -1,0 +1,15 @@
+# Rendered by deploy/install.sh; @PLACEHOLDERS@ are substituted at install time.
+# Not edited by hand -- re-run the installer to change the port or the bind.
+[Unit]
+Description=track web, a local viewer over track's findings
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=@ENV_FILE@
+ExecStart=@TRACK_BIN@ web serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

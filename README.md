@@ -164,13 +164,33 @@ could not reach is marked `unverified` and left intact, saying what stopped the
 check — a 403 is not a sold item, and the page does not let one look like the
 other. Nothing is ever inferred from "absent in the latest run".
 
-**Serving it permanently.** `contrib/track-web.service` is a `systemd --user`
-unit; it is not installed by the package.
+**Installing it.** `ownbox install track` (or `bash deploy/install.sh`) asks
+whether to serve the web view, on which port, and whether to bind `0.0.0.0` or
+`127.0.0.1`. It writes `~/.config/track/web.env`, renders a `systemd --user`
+unit and enables it. Re-running is safe and never overwrites an existing
+`web.env`; pass `TRACK_INSTALL_FORCE=1` to replace it.
 
-```
-ln -s ~/data/track/contrib/track-web.service ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now track-web
-```
+**The page has no authentication.** It is a read-only view of the findings
+database, so binding `0.0.0.0` means anyone who can reach the port can read what
+track has found. `127.0.0.1` is the default for that reason.
+
+With no terminal — a scripted or unattended install — every question takes its
+documented default and says so rather than blocking. Each also has an override,
+which is what makes the whole thing scriptable:
+
+| variable | values | default |
+|---|---|---|
+| `TRACK_WEB` | `yes` / `no` | `yes` |
+| `TRACK_WEB_PORT` | a port number | `8791` |
+| `TRACK_WEB_BIND` | `open` (0.0.0.0) / `local` (127.0.0.1) | `local` |
+| `TRACK_INSTALL_FORCE` | `1` to rewrite an existing `web.env` | unset |
+
+At runtime the service reads `TRACK_WEB_PORT` and `TRACK_WEB_HOSTS` from that
+env file, so changing the port does not mean editing a unit file.
+
+`ownbox uninstall track` removes the service, the unit and `web.env`. It keeps
+`~/.local/share/track` — the findings themselves — unless you run
+`bash deploy/uninstall.sh --purge`.
 
 **Limitations.** No authentication — it binds localhost and the tailnet only,
 and must not be put behind a public proxy. The score bar is track's own 0–1

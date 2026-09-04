@@ -2,25 +2,25 @@ schema: 1
 name: track
 description: Give it an assignment, it hunts down who sells that cheap and where, then keeps watching.
 homepage: https://github.com/BogdanStamenovic/track
-tags: [cli, deals, scheduler, python]
+tags: [deals, scraper, scheduler, web, cli, python]
+
+# Ownbox drives deploy/ rather than carrying a second, parallel install path, so
+# `ownbox install track` and a manual `bash deploy/install.sh` do the same thing.
+# The setup script asks whether to serve the web view, on which port, and
+# whether to bind 0.0.0.0 or localhost; with no terminal it takes the documented
+# defaults instead of blocking, because ownbox's command timeout is 1800s and a
+# hung prompt would burn all of it. Every answer has an environment-variable override
+# (TRACK_WEB, TRACK_WEB_PORT, TRACK_WEB_BIND) so it is scriptable too.
 install:
-  platforms: [linux, darwin, windows]
+  platforms: [linux]
   setup:
     linux:
-      - python -m venv .venv
-      - .venv/bin/python -m pip install -e .
-    darwin:
-      - python -m venv .venv
-      - .venv/bin/python -m pip install -e .
-    windows:
-      - python -m venv .venv
-      - '.venv\Scripts\python.exe -m pip install -e .'
+      - bash deploy/install.sh
   update:
-    linux: [.venv/bin/python -m pip install -e .]
-    darwin: [.venv/bin/python -m pip install -e .]
-    windows: ['.venv\Scripts\python.exe -m pip install -e .']
-  remove: []
+    linux:
+      - bash deploy/update.sh
+  remove:
+    linux:
+      - bash deploy/uninstall.sh
 command:
   linux: .venv/bin/track
-  darwin: .venv/bin/track
-  windows: '.venv\Scripts\track.exe'
