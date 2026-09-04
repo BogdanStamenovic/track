@@ -16,6 +16,8 @@ from conftest import completed, envelope
 
 from track.errors import ScoutError
 from track.scouts import (
+    CHECK_TIMEOUT,
+    DEFAULT_TIMEOUT,
     SCOUT_ALLOWED_TOOLS,
     SCOUT_TOOLS,
     ScoutFinding,
@@ -403,3 +405,8 @@ def test_the_check_prompt_carries_the_block_policy() -> None:
     check_listings(["https://kp/1"], runner=runner)
     assert "REAL stop" in seen["prompt"]
     assert "blocked" in seen["prompt"]
+
+
+def test_a_re_check_gets_longer_than_a_search_scout() -> None:
+    """It fetches a page per listing where a listing scout runs two searches."""
+    assert CHECK_TIMEOUT > DEFAULT_TIMEOUT

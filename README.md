@@ -246,9 +246,18 @@ to summarise and a query cannot.
 **The reaper.** After every research cycle, one more scout re-checks
 listings the run did *not* see — a listing a scout just found is alive by
 definition — and retires what has gone. It works through the back catalogue
-least-recently-checked first, `MAX_CHECKS_PER_RUN` at a time, so a
-135-listing assignment is swept in about a dozen runs without a run's cost
-scaling with the size of its history.
+least-recently-checked first, six at a time, so a run's cost does not scale
+with the size of its history.
+
+Six is measured, not chosen. A batch of six real listing URLs took **20s and
+$0.216** and resolved all six off the pages themselves ("Odmah dostupno",
+"posted 9 days ago, no sold marking"). That is $0.036 a URL, so twelve would
+cost about $0.43 against a $0.50 per-scout ceiling — and twelve is exactly
+what timed out at 120s on the first live run, correctly retiring nothing and
+wasting the scout. Six leaves 72% headroom on the clock at half the budget.
+What grows with the back catalogue is how long a full sweep takes: at a 6h
+interval a 137-listing assignment is swept in under four days, and faster in
+practice, since listings the run itself saw need no check.
 
 **Retirement is a marking. Nothing is ever deleted.** A retired listing keeps
 every sighting row it ever had, so "what did that cost in July" stays

@@ -250,6 +250,11 @@ def _year(value: Any) -> int | None:
     return year if 1990 <= year <= datetime.now(timezone.utc).year + 1 else None
 
 
+# Re-checking fetches a page per listing, where a listing scout runs a couple
+# of searches, so it needs longer than DEFAULT_TIMEOUT. Six URLs measured at
+# 20s; this is nine times that, so that one slow site cannot cost the batch.
+CHECK_TIMEOUT = 180
+
 CHECK_SCOUT_TEMPLATE = """You are checking whether listings are still for sale.
 Fetch each URL below and report what you find. Do not buy anything and do not
 contact anyone.
@@ -283,7 +288,7 @@ def check_listings(
     urls: list[str],
     *,
     model: str = DEFAULT_MODEL,
-    timeout: int = DEFAULT_TIMEOUT,
+    timeout: int = CHECK_TIMEOUT,
     runner: Runner = _default_runner,
     max_budget_usd: str = SCOUT_MAX_BUDGET_USD,
 ) -> tuple[list[ListingCheck], float]:

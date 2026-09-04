@@ -30,11 +30,24 @@ from .models import Finding
 from .scoring import Market, tokenize
 from .store import Store
 
-# How many listings one run re-checks. This is one extra scout on top of the
-# five a cycle already spends, and it works through the back catalogue
-# least-recently-checked first, so nothing is skipped forever -- a 135-listing
-# assignment is fully swept in about a dozen runs.
-MAX_CHECKS_PER_RUN = 12
+# How many listings one run re-checks, and how long that scout may take.
+#
+# Both are measured rather than picked. A batch of six real listing URLs took
+# **20s and $0.216** and came back with all six correctly resolved off the
+# pages themselves ("Odmah dostupno", "posted 9 days ago, no sold marking").
+# That is $0.036 a URL, so twelve would cost about $0.43 against a
+# SCOUT_MAX_BUDGET_USD ceiling of $0.50 -- and twelve is exactly what timed
+# out at 120s on the first live run, retiring nothing, correctly, and wasting
+# the scout.
+#
+# So six, which leaves 72% headroom on the clock and runs at half the budget
+# ceiling. The scout's own wall-clock allowance is CHECK_TIMEOUT in scouts.py,
+# set well above the measurement so one slow site cannot cost the batch.
+# The cost of a run stays flat as the back catalogue grows; what grows is how
+# long a full sweep takes. At six a run and a 6h interval, a 137-listing
+# assignment is swept in under four days -- and listings the run itself saw
+# are alive without being checked at all, so in practice it is faster.
+MAX_CHECKS_PER_RUN = 6
 
 # Inconclusive checks before a listing is retired as gone. Three, because a
 # single unreachable fetch is routine and two consecutive ones are still

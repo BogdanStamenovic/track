@@ -280,12 +280,14 @@ def _verdict(f: Finding) -> str:
     if f.score_basis == "mispricing" and f.reference_price:
         peers = f.reference_n or 0
         gap = (f.reference_price - (f.price or 0.0)) / f.reference_price
-        direction = "under" if gap >= 0 else "over"
-        return (
-            f"score {f.score:.2f} — **{abs(gap):.0%} {direction}** the "
-            f"{_money(f.reference_price, f.currency)} that {peers} comparable "
+        asking = (
+            f"the {_money(f.reference_price, f.currency)} that {peers} comparable "
             f"listing{'s' if peers != 1 else ''} ask"
         )
+        if abs(gap) < 0.005:
+            return f"score {f.score:.2f} — priced at {asking}"
+        direction = "under" if gap > 0 else "over"
+        return f"score {f.score:.2f} — **{abs(gap):.0%} {direction}** {asking}"
     return f"score {f.score:.2f} — _no comparable found; ranked on price alone_"
 
 
