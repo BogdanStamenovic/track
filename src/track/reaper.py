@@ -155,7 +155,13 @@ def reap(
     due = store.listings_due_for_check(
         assignment_id, exclude=seen_keys, limit=MAX_CHECKS_PER_RUN
     )
-    by_url = {f.url: f for f in due if f.url}
+    # One listing per URL. The store already refuses to hand over listings
+    # that only have a search-page URL, so anything left sharing one would be
+    # a listing whose check result belongs to something else.
+    by_url: dict[str, Finding] = {}
+    for finding in due:
+        if finding.url and finding.url not in by_url:
+            by_url[finding.url] = finding
 
     gone: list[str] = []
     blocked = 0
@@ -180,9 +186,10 @@ def reap(
             if url not in answered
         ]
         for result in results:
-            finding = by_url.get(result.url)
-            if finding is None:
+            checked = by_url.get(result.url)
+            if checked is None:
                 continue
+            finding = checked
             if result.state == "live":
                 store.record_check(
                     assignment_id, finding.dedup_key, conclusive=True, note=result.note

@@ -477,8 +477,12 @@ from deploying it that way, rather than assumptions:
   nothing filters on it: track will happily report a 32GB kit for a 16GB
   assignment if a scout thought it was relevant.
 - No alerting threshold — every run posts, even a quiet one.
-- Nothing re-checks a listing that came back without a URL. It can be retired
-  as superseded, never as gone.
+- Nothing re-checks a listing whose only URL is a search or category page,
+  which is 39 of 137 listings on one assignment and 9 of 42 on the other. That page renders
+  fine whether or not the item is still on it, so a "live" answer would mean
+  nothing and a "gone" answer would retire everything behind that URL at
+  once. Those listings can be retired as superseded, never as gone. The same
+  applies to a find that came back with no URL at all.
 - Supersession almost never fires on the data measured so far, by design —
   see the table above. If the intent is "hide anything worse than the best
   find", that is a ranking question and the score already answers it.

@@ -26,6 +26,7 @@ from .errors import StoreError
 from .models import Assignment, Finding, ListingStatus, Run, Source
 from .scoring import dedup_key as _dedup_key
 from .scoring import index_url_bases as _index_url_bases
+from .scoring import url_basis as _url_basis
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS assignments (
@@ -701,8 +702,21 @@ class Store:
             "ORDER BY COALESCE(s.last_checked_at, '') ASC, f.id ASC",
             (assignment_id, assignment_id),
         ).fetchall()
-        out = [_row_to_finding(row) for row in rows if row["dedup_key"] not in exclude]
-        return out[:limit]
+        # A listing whose only URL is a search or category page cannot be
+        # re-checked by fetching it: the page will render perfectly whether or
+        # not that particular item is still on it, so a "live" answer would
+        # mean nothing and a "gone" answer would retire every listing behind
+        # that URL at once. Twelve due listings collapsed to seven distinct
+        # URLs before this, and the five that shared one were dropped without
+        # a word.
+        index_bases = self.index_url_bases(assignment_id)
+        return [
+            finding
+            for row in rows
+            if (finding := _row_to_finding(row)).dedup_key not in exclude
+            and finding.url is not None
+            and _url_basis(finding.url) not in index_bases
+        ][:limit]
 
     def record_check(
         self, assignment_id: str, dedup_key: str, *, conclusive: bool, note: str | None

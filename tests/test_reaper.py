@@ -291,3 +291,47 @@ def test_a_live_check_leaves_no_retirement_note_behind(store: Store, assignment)
     assert status.last_check_note == "still listed at 300 EUR"
     assert status.retired_note is None
     assert status.retired_at is None
+
+
+def test_a_listing_only_reachable_through_a_search_page_is_not_checked(
+    store: Store, assignment
+) -> None:
+    """The search page renders fine whether or not that item is still on it,
+    so "live" would mean nothing and "gone" would retire every listing on it."""
+    url = "https://kp.com/graficke/pretraga?keywords=RTX+3060"
+    store.register_index_urls(assignment.id, {"kp.com/graficke/pretraga"})
+    for title in ("MSI RTX 3060 12GB", "ASUS RTX 3060 12GB"):
+        store.add_finding(
+            assignment.id, store.start_run(assignment.id), "KP", title, 245.0, "EUR", url,
+            dedup_key("KP", title, url, {"kp.com/graficke/pretraga"}), 0.5, True,
+        )
+    asked: list[list[str]] = []
+
+    reap(
+        store, assignment.id, EMPTY_MARKET, seen_keys=set(),
+        check=lambda urls, **k: (asked.append(urls), ([], 0.0))[1],
+    )
+
+    assert asked == []
+    assert all(
+        store.listing_status(assignment.id, f.dedup_key).retired_at is None
+        for f in store.latest_findings(assignment.id)
+    )
+
+
+def test_due_listings_are_never_silently_dropped_for_sharing_a_url(
+    store: Store, assignment
+) -> None:
+    """Twelve listings collapsed to seven URLs once, and the five that shared
+    one vanished from the check without a word."""
+    for i in range(4):
+        _add(store, assignment.id, f"ThinkPad T{i}", 300.0, f"https://kp/{i}")
+    asked: list[list[str]] = []
+
+    outcome = reap(
+        store, assignment.id, EMPTY_MARKET, seen_keys=set(),
+        check=lambda urls, **k: (asked.append(urls), ([], 0.0))[1],
+    )
+
+    assert sorted(asked[0]) == [f"https://kp/{i}" for i in range(4)]
+    assert outcome.checked == 4
