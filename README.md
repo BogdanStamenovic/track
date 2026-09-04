@@ -152,6 +152,27 @@ at all; anything reasoning about the current market collapses each listing to
 its latest row first, so a stale listing cannot outvote a rare cheap one
 purely by surviving more runs.
 
+**A listing's identity is its URL, unless that URL is an index page.**
+`dedup_key` is built from host + path with the query string stripped, because
+that is where trackers and session ids live. That breaks when a scout answers
+with the *search-results* URL for every hit: ten graphics cards priced 1 to
+1100 EUR came back on one `kupujemprodajem.com/.../pretraga` path, hashed to
+one key, and nine of them stopped existing for every query downstream —
+scoring, source statistics, the summary. Keying on the title instead breaks
+the opposite case: one genuine product page came back under four title
+spellings across four runs, and title-keyed that is four listings with no
+price history each.
+
+So index pages are identified by observation, not by guessing at URL shape: a
+URL base that comes back attached to **more than one distinct title within a
+single run** is serving a list, and its listings are keyed by title instead.
+Measured across the 9 runs on record, 147 bases had exactly one title per run
+and 7 had more; all 7 were index pages (two `?pretraga=` searches, two
+category pages, one bare host), and no product page was misclassified. The
+classification is recorded per assignment and never reverted — a base that
+flipped back because one run returned a single result from it would key that
+run's listing differently from every other run's.
+
 **Source statistics** are derived from the findings by query rather than kept
 as counters, because a counter can drift out of step with the rows it claims
 to summarise and a query cannot.

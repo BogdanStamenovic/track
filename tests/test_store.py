@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from track.errors import StoreError
+from track.scoring import dedup_key
 from track.store import Store
 
 
@@ -213,3 +214,53 @@ def test_undeleteable_path_is_a_store_error(tmp_path: Path) -> None:
     directory.mkdir()
     with pytest.raises(StoreError, match="cannot open database"):
         Store(directory)
+
+
+def test_index_url_registration_survives_a_reopen(tmp_path: Path) -> None:
+    db = tmp_path / "t.db"
+    with Store(db) as s:
+        s.add_assignment("laptop", 3600)
+        s.register_index_urls("a", {"kp.com/pretraga"})
+    with Store(db) as s:
+        assert s.index_url_bases("a") == {"kp.com/pretraga"}
+
+
+def test_repair_splits_listings_that_shared_a_search_url(tmp_path: Path) -> None:
+    """The historical rows are recomputed, not dropped: same rows, more listings."""
+    db = tmp_path / "t.db"
+    url = "https://kp.com/graficke/pretraga?keywords=RTX+3060"
+    with Store(db) as s:
+        a = s.add_assignment("a gpu", 3600)
+        run = s.start_run(a.id)
+        for title, price in [("MSI RTX 3060", 245.0), ("ASUS RTX 3060", 399.0)]:
+            s.add_finding(
+                a.id, run, "KP", title, price, "EUR", url,
+                dedup_key("KP", title, url), 0.5, True,
+            )
+        assert len(s.latest_findings(a.id)) == 1  # the bug, reproduced
+        s._conn.execute("DELETE FROM schema_meta WHERE name = 'repair_dedup_keys_v1'")
+        s._conn.commit()
+    with Store(db) as s:
+        rows = s._conn.execute("SELECT count(*) c FROM findings").fetchone()["c"]
+        assert rows == 2
+        assert len(s.latest_findings(a.id)) == 2
+        assert s.index_url_bases(a.id) == {"kp.com/graficke/pretraga"}
+
+
+def test_repair_leaves_genuine_product_pages_merged(tmp_path: Path) -> None:
+    """A product page retitled between runs must stay one listing, not become two."""
+    db = tmp_path / "t.db"
+    url = "https://konovo.rs/proizvod/elitebook-855"
+    with Store(db) as s:
+        a = s.add_assignment("a laptop", 3600)
+        for title in ["HP EliteBook 855 G8", "HP EliteBook 855 G8 (Grade C)"]:
+            run = s.start_run(a.id)
+            s.add_finding(
+                a.id, run, "Konovo", title, 54500.0, "RSD", url,
+                dedup_key("Konovo", title, url), 0.5, True,
+            )
+        s._conn.execute("DELETE FROM schema_meta WHERE name = 'repair_dedup_keys_v1'")
+        s._conn.commit()
+    with Store(db) as s:
+        assert len(s.latest_findings(a.id)) == 1
+        assert s.index_url_bases(a.id) == set()

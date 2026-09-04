@@ -28,7 +28,7 @@ from . import scheduler, scouts
 from .errors import TrackError
 from .models import Assignment, Finding, SourceStat
 from .report import build_summary, post_summary
-from .scoring import dedup_key, source_stats, underpriced_score
+from .scoring import dedup_key, index_url_bases, source_stats, underpriced_score
 from .store import Store
 
 DEFAULT_SOURCE_LIMIT = 5
@@ -174,12 +174,28 @@ def run_assignment(
             "the site would not serve one"
         )
 
+    # A scout that answers with the search-results URL for every hit gives
+    # ten listings one URL; keyed on it they become one listing and nine stop
+    # existing. Bases seen serving several titles *in this run* are index
+    # pages, and the registry is consulted as well so a base identified in an
+    # earlier run keeps its classification when this run happens to return a
+    # single result from it.
+    fresh_index = index_url_bases((f.url, f.title) for f in scouted.findings)
+    known_index = store.index_url_bases(assignment.id)
+    if fresh_index - known_index:
+        store.register_index_urls(assignment.id, fresh_index - known_index)
+        warn(
+            f"{len(fresh_index - known_index)} search/category URL(s) will be identified "
+            "by listing title from now on"
+        )
+    index_bases = known_index | fresh_index
+
     # Frozen for the whole run, on purpose, and keyed by currency: a finding
     # is scored only against others quoted in the same one.
     history = store.price_history(assignment.id)
     stored: list[Finding] = []
     for raw in scouted.findings:
-        key = dedup_key(raw.source, raw.title, raw.url)
+        key = dedup_key(raw.source, raw.title, raw.url, index_bases)
         is_new = not store.has_seen(assignment.id, key)
         score = (
             underpriced_score(raw.price, history.get(raw.currency, []))

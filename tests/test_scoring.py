@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from track.models import Finding
-from track.scoring import dedup_key, source_stats, underpriced_score
+from track.scoring import dedup_key, index_url_bases, source_stats, underpriced_score
 
 
 def _finding(
@@ -130,3 +130,58 @@ def test_price_rate_reports_partial_readability() -> None:
 
 def test_no_findings_means_no_stats() -> None:
     assert source_stats([]) == []
+
+
+# -- index urls ----------------------------------------------------------
+
+
+def test_a_search_page_serving_many_titles_is_recognised_as_an_index() -> None:
+    listings = [
+        ("https://kp.com/graficke/pretraga?keywords=RTX+3060", "MSI RTX 3060 12GB"),
+        ("https://kp.com/graficke/pretraga?keywords=RTX+3090", "Zotac RTX 3090 24GB"),
+    ]
+    assert index_url_bases(listings) == {"kp.com/graficke/pretraga"}
+
+
+def test_a_product_page_seen_once_per_run_is_not_an_index() -> None:
+    listings = [
+        ("https://konovo.rs/proizvod/elitebook-855", "HP EliteBook 855 G8"),
+        ("https://konovo.rs/proizvod/thinkpad-t490", "Lenovo ThinkPad T490"),
+    ]
+    assert index_url_bases(listings) == set()
+
+
+def test_the_same_title_twice_on_one_url_is_not_an_index() -> None:
+    """Two sightings of one listing, not two listings sharing a page."""
+    listings = [
+        ("https://konovo.rs/proizvod/elitebook-855", "HP EliteBook 855 G8"),
+        ("https://konovo.rs/proizvod/elitebook-855", "HP  EliteBook  855  G8 "),
+    ]
+    assert index_url_bases(listings) == set()
+
+
+def test_listings_on_an_index_url_keep_separate_identities() -> None:
+    """The regression that motivated this: ten cards, one search URL, one key."""
+    index = {"kp.com/graficke/pretraga"}
+    url = "https://kp.com/graficke/pretraga?keywords=RTX+3060"
+    a = dedup_key("KP", "MSI RTX 3060 12GB", url, index)
+    b = dedup_key("KP", "ASUS RTX 3060 12GB", url, index)
+    assert a != b
+    # ...and without the classification they collide, which is the bug.
+    assert dedup_key("KP", "MSI RTX 3060 12GB", url) == dedup_key("KP", "ASUS RTX 3060 12GB", url)
+
+
+def test_an_index_listing_is_still_one_listing_across_runs() -> None:
+    """Title-keyed identity has to survive the URL's query string changing."""
+    index = {"kp.com/graficke/pretraga"}
+    first = dedup_key("KP", "MSI RTX 3060 12GB", "https://kp.com/graficke/pretraga?p=1", index)
+    later = dedup_key("KP", "MSI RTX 3060 12GB", "https://kp.com/graficke/pretraga?p=2", index)
+    assert first == later
+
+
+def test_a_product_url_still_outranks_a_retitled_listing() -> None:
+    """One product page, four title spellings across runs, still one listing."""
+    url = "https://konovo.rs/proizvod/hp-elitebook-855-g8"
+    assert dedup_key("Konovo", "HP EliteBook 855 G8 (Grade C)", url) == dedup_key(
+        "Konovo", "HP EliteBook 855 G8 - Grade C, 16GB RAM", url
+    )

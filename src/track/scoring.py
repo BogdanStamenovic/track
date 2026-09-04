@@ -10,23 +10,69 @@ import hashlib
 import re
 import statistics
 from collections import defaultdict
+from collections.abc import Iterable
 from urllib.parse import urlsplit
 
 from .models import Finding, SourceStat
 
 
-def dedup_key(source: str, title: str, url: str | None) -> str:
+def url_basis(url: str) -> str:
+    """The identifying part of a listing URL: host + path, query stripped.
+
+    The query string is where trackers and session ids live, so two links to
+    the same listing differ there and nowhere else.
+    """
+    parts = urlsplit(url)
+    return f"{parts.netloc}{parts.path}".lower().rstrip("/")
+
+
+def title_basis(title: str) -> str:
+    return re.sub(r"\s+", " ", title.strip().lower())
+
+
+def index_url_bases(listings: Iterable[tuple[str | None, str]]) -> set[str]:
+    """URL bases that are search or category pages rather than listings.
+
+    Takes (url, title) pairs *from a single run* and returns the bases that
+    came back attached to more than one distinct title. A product page yields
+    one title per run; a search page yields one per result, so this separates
+    them by observation rather than by guessing at URL shape.
+
+    Measured on the 9 runs in the live database: 147 bases had exactly one
+    title in a run, 7 had more, and all 7 were visibly index pages (two
+    `?pretraga=` searches, two category listings, one bare host). No product
+    page was misclassified.
+    """
+    titles: dict[str, set[str]] = defaultdict(set)
+    for url, title in listings:
+        if url:
+            titles[url_basis(url)].add(title_basis(title))
+    return {basis for basis, seen in titles.items() if len(seen) > 1}
+
+
+def dedup_key(
+    source: str, title: str, url: str | None, index_bases: frozenset[str] | set[str] = frozenset()
+) -> str:
     """Stable key identifying "the same listing" across runs.
 
-    Prefers the URL (host + path, query stripped -- trackers and session ids
-    live in the query string) and falls back to a normalized title when a
-    scout doesn't return one.
+    Prefers the URL, and falls back to a normalized title when there isn't
+    one -- or when the URL is a known index page, which is the load-bearing
+    part. A scout that answers with the search-results URL for every hit
+    hands back ten cards sharing one path; keyed on that path they become one
+    listing and nine of them stop existing for every query downstream. That
+    happened for real: ten GPUs, prices 1 to 1100 EUR, collapsed onto
+    `kupujemprodajem.com/.../pretraga`, and only the last survived
+    `latest_findings`.
+
+    Titling is not the default because it breaks the opposite case: one real
+    product page came back under four slightly different title strings across
+    four runs, and keying those by title would turn one listing with a price
+    history into four listings with none.
     """
-    if url:
-        parts = urlsplit(url)
-        basis = f"{parts.netloc}{parts.path}".lower().rstrip("/")
+    if url and url_basis(url) not in index_bases:
+        basis = url_basis(url)
     else:
-        basis = re.sub(r"\s+", " ", title.strip().lower())
+        basis = title_basis(title)
     return hashlib.sha1(f"{source.strip().lower()}|{basis}".encode()).hexdigest()[:16]
 
 

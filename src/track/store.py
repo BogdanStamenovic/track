@@ -23,6 +23,8 @@ from pathlib import Path
 
 from .errors import StoreError
 from .models import Assignment, Finding, Run, Source
+from .scoring import dedup_key as _dedup_key
+from .scoring import index_url_bases as _index_url_bases
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS assignments (
@@ -74,6 +76,18 @@ CREATE TABLE IF NOT EXISTS findings (
     found_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS index_urls (
+    assignment_id TEXT NOT NULL,
+    url_basis TEXT NOT NULL,
+    noticed_at TEXT NOT NULL,
+    PRIMARY KEY (assignment_id, url_basis)
+);
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+    name TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_findings_assignment ON findings(assignment_id);
 CREATE INDEX IF NOT EXISTS idx_findings_dedup ON findings(assignment_id, dedup_key);
 CREATE INDEX IF NOT EXISTS idx_runs_assignment ON runs(assignment_id);
@@ -114,6 +128,7 @@ class Store:
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(SCHEMA)
         self._migrate()
+        self._repair_dedup_keys()
         self._conn.commit()
 
     def _migrate(self) -> None:
@@ -123,6 +138,80 @@ class Store:
             }
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+    def _applied(self, name: str) -> bool:
+        row = self._conn.execute("SELECT 1 FROM schema_meta WHERE name = ?", (name,)).fetchone()
+        return row is not None
+
+    def _mark_applied(self, name: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (name, applied_at) VALUES (?, ?)", (name, _now())
+        )
+
+    def _repair_dedup_keys(self) -> None:
+        """One-off repair of keys computed before index URLs were recognised.
+
+        Runs once, over whatever history the database already holds: work out
+        which URL bases were serving several listings at a time, record them,
+        and recompute every finding's key. Nothing is deleted -- each row
+        keeps its price, its timestamp and its run -- but rows that had been
+        merged onto one key become separately reachable again, which for the
+        database this shipped against means 46 listings that
+        `latest_findings` could not see.
+        """
+        name = "repair_dedup_keys_v1"
+        if self._applied(name):
+            return
+        rows = self._conn.execute(
+            "SELECT id, assignment_id, run_id, source, title, url FROM findings"
+        ).fetchall()
+        if rows:
+            per_run: dict[tuple[str, int], list[tuple[str | None, str]]] = {}
+            for row in rows:
+                per_run.setdefault((row["assignment_id"], row["run_id"]), []).append(
+                    (row["url"], row["title"])
+                )
+            discovered: dict[str, set[str]] = {}
+            for (assignment_id, _run), listings in per_run.items():
+                discovered.setdefault(assignment_id, set()).update(_index_url_bases(listings))
+            for assignment_id, bases in discovered.items():
+                self._register_index_urls(assignment_id, bases)
+            for row in rows:
+                bases = discovered.get(row["assignment_id"], set())
+                key = _dedup_key(row["source"], row["title"], row["url"], bases)
+                self._conn.execute(
+                    "UPDATE findings SET dedup_key = ? WHERE id = ?", (key, row["id"])
+                )
+        self._mark_applied(name)
+
+    # -- index urls ------------------------------------------------------
+
+    def _register_index_urls(self, assignment_id: str, bases: set[str]) -> None:
+        now = _now()
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO index_urls (assignment_id, url_basis, noticed_at) "
+            "VALUES (?, ?, ?)",
+            [(assignment_id, basis, now) for basis in sorted(bases)],
+        )
+
+    def register_index_urls(self, assignment_id: str, bases: set[str]) -> None:
+        """Remember URLs seen serving several listings at once.
+
+        Registration is permanent on purpose. A base that flipped back to
+        "identifying" because one run happened to return a single result from
+        it would key that run's listing differently from every other run's,
+        splitting one listing's history in two.
+        """
+        if not bases:
+            return
+        self._register_index_urls(assignment_id, bases)
+        self._conn.commit()
+
+    def index_url_bases(self, assignment_id: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT url_basis FROM index_urls WHERE assignment_id = ?", (assignment_id,)
+        ).fetchall()
+        return {row["url_basis"] for row in rows}
 
     def close(self) -> None:
         self._conn.close()
@@ -221,6 +310,7 @@ class Store:
         self._conn.execute("DELETE FROM findings WHERE assignment_id = ?", (assignment_id,))
         self._conn.execute("DELETE FROM runs WHERE assignment_id = ?", (assignment_id,))
         self._conn.execute("DELETE FROM sources WHERE assignment_id = ?", (assignment_id,))
+        self._conn.execute("DELETE FROM index_urls WHERE assignment_id = ?", (assignment_id,))
         self._conn.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
         self._conn.commit()
 

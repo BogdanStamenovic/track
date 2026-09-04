@@ -462,3 +462,48 @@ def test_the_market_is_passed_to_source_discovery(store: Store, monkeypatch) -> 
     ensure_sources(store, a)
 
     assert seen["market"] == "Serbia"
+
+
+# -- index urls ----------------------------------------------------------
+
+
+def test_a_run_keeps_listings_that_share_a_search_url_apart(store: Store, monkeypatch) -> None:
+    """Ten cards behind one `?keywords=` URL must not collapse into one listing."""
+    a = store.add_assignment("a gpu", 3600)
+    store.upsert_source(a.id, "KP")
+    url = "https://kp.com/graficke/pretraga?keywords=RTX+3060"
+    _fake_scouts(
+        monkeypatch,
+        [
+            ScoutFinding("KP", "MSI RTX 3060 12GB", 245.0, "EUR", url),
+            ScoutFinding("KP", "ASUS RTX 3060 12GB", 399.0, "EUR", url),
+        ],
+    )
+
+    run_assignment(store, a)
+
+    assert len(store.latest_findings(a.id)) == 2
+    assert store.index_url_bases(a.id) == {"kp.com/graficke/pretraga"}
+
+
+def test_an_index_url_stays_classified_when_a_later_run_returns_one_hit(
+    store: Store, monkeypatch
+) -> None:
+    """Otherwise the same listing gets a different key run to run, splitting it."""
+    a = store.add_assignment("a gpu", 3600)
+    store.upsert_source(a.id, "KP")
+    url = "https://kp.com/graficke/pretraga?keywords=RTX+3060"
+    _fake_scouts(
+        monkeypatch,
+        [
+            ScoutFinding("KP", "MSI RTX 3060 12GB", 245.0, "EUR", url),
+            ScoutFinding("KP", "ASUS RTX 3060 12GB", 399.0, "EUR", url),
+        ],
+    )
+    run_assignment(store, a)
+
+    _fake_scouts(monkeypatch, [ScoutFinding("KP", "MSI RTX 3060 12GB", 230.0, "EUR", url)])
+    second = run_assignment(store, store.get_assignment(a.id))
+
+    assert [f.is_new for f in second.findings] == [False]
+    assert len(store.latest_findings(a.id)) == 2
