@@ -136,7 +136,16 @@ def build_summary(
     if scout_failures and new_findings:
         lines.append(f"\n_{scout_failures} scout(s) failed; this run saw less than usual._")
     if cost_usd:
-        lines.append(f"\n_scouts: ${cost_usd:.3f}_")
+        # Labelled, not just printed. The number is `total_cost_usd` out of the
+        # `claude -p` JSON envelope, which the CLI emits whatever it is
+        # authenticated with -- so on a subscription it is an API-list-price
+        # equivalent of the work done and bills nothing, and only on an API key
+        # is it money. Unqualified it reads as a charge, and the first person
+        # to see it in Discord asked whether it was hitting his card.
+        lines.append(
+            f"\n_scouts: ~${cost_usd:.2f} of model usage at list price "
+            "(no charge on a Claude subscription)_"
+        )
     if schedule_error:
         # Last line and unmissable: this run is the last one unless someone
         # intervenes, which is more important than anything it found.

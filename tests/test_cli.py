@@ -9,6 +9,7 @@ import pytest
 
 from track.cli import main
 from track.engine import RunOutcome
+from track.errors import TrackError
 from track.scheduler import ScheduleResult
 from track.store import Store
 
@@ -175,7 +176,7 @@ def test_list_json_is_parseable(capsys, db: Path) -> None:
     assert rows[0]["text"] == "a laptop"
 
 
-def test_show_reports_schedule_sources_and_spend(capsys, db: Path) -> None:
+def test_show_reports_schedule_sources_and_usage(capsys, db: Path) -> None:
     assignment_id = _add(db, "--notify", "x")
     with Store(db) as store:
         store.upsert_source(assignment_id, "eBay", "https://ebay.com")
@@ -193,7 +194,7 @@ def test_show_reports_schedule_sources_and_spend(capsys, db: Path) -> None:
     assert "eBay" in out
     assert "ThinkPad" in out
     assert "300.00 USD" in out
-    assert "$0.200 spent" in out
+    assert "~$0.20 of model usage" in out
 
 
 def test_sources_reports_statistics(capsys, db: Path) -> None:
@@ -455,3 +456,95 @@ def test_an_unscheduled_assignment_still_runs_without_force(db: Path, monkeypatc
     _outcome(monkeypatch)
 
     assert main(["--db", str(db), "run", assignment_id]) == 0
+
+
+# -- run --all-active ----------------------------------------------------
+
+
+def _result(*, usable: int = 1, posted: bool = True, summary: str = "s") -> RunOutcome:
+    return RunOutcome(
+        findings=[], summary=summary, posted=posted, usable=usable, scout_failures=0
+    )
+
+
+def test_run_needs_either_an_id_or_all_active(capsys, db: Path) -> None:
+    assert main(["--db", str(db), "run"]) == 2
+    assert main(["--db", str(db), "run", "abc", "--all-active"]) == 2
+
+
+def test_all_active_runs_every_active_assignment(capsys, db: Path, monkeypatch) -> None:
+    first, second = _add(db), _add(db)
+    ran: list[str] = []
+
+    def fake(store, assignment, **kwargs):
+        ran.append(assignment.id)
+        return _result(summary=f"summary for {assignment.id}")
+
+    monkeypatch.setattr("track.cli.run_assignment", fake)
+    capsys.readouterr()
+
+    assert main(["--db", str(db), "run", "--all-active"]) == 0
+    assert sorted(ran) == sorted([first, second])
+    assert f"summary for {second}" in capsys.readouterr().out
+
+
+def test_all_active_skips_paused_assignments(capsys, db: Path, monkeypatch) -> None:
+    active, paused = _add(db), _add(db)
+    assert main(["--db", str(db), "pause", paused]) == 0
+    ran: list[str] = []
+    monkeypatch.setattr(
+        "track.cli.run_assignment",
+        lambda store, a, **k: (ran.append(a.id), _result())[1],
+    )
+
+    assert main(["--db", str(db), "run", "--all-active"]) == 0
+    assert ran == [active]
+
+
+def test_one_failing_assignment_does_not_cancel_the_others(
+    capsys, db: Path, monkeypatch
+) -> None:
+    """A failing laptop hunt must not silently take the GPU hunt with it."""
+    first, second = _add(db), _add(db)
+    ran: list[str] = []
+
+    def fake(store, assignment, **kwargs):
+        ran.append(assignment.id)
+        if assignment.id == first:
+            raise TrackError("scouts all died")
+        return _result()
+
+    monkeypatch.setattr("track.cli.run_assignment", fake)
+
+    code = main(["--db", str(db), "run", "--all-active"])
+
+    assert sorted(ran) == sorted([first, second])
+    assert code == 3
+
+
+def test_an_unposted_summary_outranks_a_merely_empty_one(db: Path, monkeypatch) -> None:
+    """One silent assignment out of two is still a silent assignment."""
+    _add(db), _add(db)
+    outcomes = iter([_result(usable=0, posted=False), _result(usable=5)])
+    monkeypatch.setattr("track.cli.run_assignment", lambda *a, **k: next(outcomes))
+
+    assert main(["--db", str(db), "run", "--all-active"]) == 3
+
+
+def test_all_active_reports_1_when_nothing_was_usable(db: Path, monkeypatch) -> None:
+    _add(db), _add(db)
+    monkeypatch.setattr("track.cli.run_assignment", lambda *a, **k: _result(usable=0))
+
+    assert main(["--db", str(db), "run", "--all-active"]) == 1
+
+
+def test_all_active_with_no_active_assignments_is_not_success(db: Path) -> None:
+    assert main(["--db", str(db), "run", "--all-active"]) == 1
+
+
+def test_no_schedule_does_not_claim_an_interval(capsys, db: Path) -> None:
+    capsys.readouterr()
+    main(["--db", str(db), "add", "a laptop", "--interval", "6h", "--no-schedule"])
+    err = capsys.readouterr().err
+    assert "every 6h" not in err
+    assert "not scheduled" in err

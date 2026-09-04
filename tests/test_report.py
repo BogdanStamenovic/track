@@ -240,9 +240,18 @@ def test_a_source_that_blocks_prices_is_named_as_unreadable_not_as_cheap() -> No
     assert "Cheapest sources" not in summary
 
 
-def test_spend_is_reported_when_there_was_any() -> None:
-    assert "$0.240" in build_summary(_assignment(), [_finding()], 3, cost_usd=0.24)
+def test_scout_usage_is_reported_when_there_was_any() -> None:
+    summary = build_summary(_assignment(), [_finding()], 3, cost_usd=0.24)
+    assert "~$0.24" in summary
     assert "scouts:" not in build_summary(_assignment(), [_finding()], 3, cost_usd=0.0)
+
+
+def test_the_usage_figure_is_never_presented_as_a_charge() -> None:
+    """It is an API-list-price equivalent; on a subscription it bills nothing,
+    and a bare dollar amount in Discord was read as money off a card."""
+    summary = build_summary(_assignment(), [_finding()], 3, cost_usd=0.24)
+    assert "no charge on a Claude subscription" in summary
+    assert "spent" not in summary
 
 
 # -- delivery ------------------------------------------------------------

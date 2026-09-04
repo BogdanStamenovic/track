@@ -35,7 +35,7 @@ track add "<what to track>" [--interval 6h] [--max-price N] [--notify AGENT]
 track list [--json]
 track show <assignment-id> [--limit N] [--json]
 track sources <assignment-id> [--json]
-track run <assignment-id> [--no-post] [--force]
+track run <assignment-id> | --all-active [--no-post] [--force]
 track unschedule <assignment-id>
 track pause <assignment-id>
 track resume <assignment-id>
@@ -53,6 +53,7 @@ track remove <assignment-id>
 | `--wake-on` | wake origin name of the machine that should run the check |
 | `unschedule` | drop track's own recurring wakeup but keep the assignment runnable, for when an external scheduler owns the timing |
 | `--no-post` | run without posting to Discord |
+| `--all-active` | run every active assignment in turn, for a scheduler that owns one wakeup for the whole database |
 | `--force` | run an assignment that is paused |
 | `-v, --verbose` | detailed progress on stderr |
 | `-q, --quiet` | suppress non-error output |
@@ -74,6 +75,13 @@ and its exit status is the only signal that reaches anyone:
 look alike to whatever fired the run. A report that never reached its channel
 gets its own code rather than being folded into a generic failure, because it
 is the one outcome nobody will otherwise hear about.
+
+`--all-active` collapses several runs into one code on the same principle: `3`
+if **any** summary failed to post, else `0` if any assignment turned something
+up, else `1`. One silent assignment out of three is still a silent
+assignment. Assignments run one after another, not in parallel — a single
+cycle already fans out five scouts — and one failing assignment never stops
+the ones after it.
 
 stdout carries real output only — assignment ids, listings, summaries; everything
 else goes to stderr.
@@ -100,7 +108,7 @@ Cheapest sources so far:
   Micro Center: from 87.96 USD (median 87.96 USD, 1 listings)
   no price readable from: Newegg, Facebook Marketplace
 
-_scouts: $0.292_
+_scouts: ~$0.29 of model usage at list price (no charge on a Claude subscription)_
 
 $ track sources b15f0a7b
 b15f0a7b: a 16GB DDR4-3200 desktop RAM kit, used or open-box

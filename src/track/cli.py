@@ -21,6 +21,11 @@ nobody watching and its exit status is the only signal that reaches anyone:
 Silence and success must not look alike at 08:00, so "ran but found nothing"
 is deliberately not 0, and a report that never reached Discord is its own
 code rather than being folded into a generic failure.
+
+`track run --all-active` runs every active assignment and collapses their
+outcomes into one code on the same principle: 3 if *any* summary failed to
+post, else 0 if any assignment turned something up, else 1. One silent
+assignment out of three is still a silent assignment.
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from . import __version__
-from .engine import run_assignment, run_command
+from .engine import RunOutcome, run_assignment, run_command
 from .errors import TrackError
 from .models import Assignment
 from .scheduler import cancel as cancel_schedule
@@ -118,7 +123,17 @@ def _build_parser() -> argparse.ArgumentParser:
     sources_p.add_argument("--json", action="store_true", help="emit JSON")
 
     run_p = sub.add_parser("run", help="run one research cycle for an assignment now")
-    run_p.add_argument("assignment_id")
+    run_p.add_argument(
+        "assignment_id",
+        nargs="?",
+        help="which assignment to run; omit it and pass --all-active instead",
+    )
+    run_p.add_argument(
+        "--all-active",
+        action="store_true",
+        help="run every active assignment in turn -- what a scheduler with one "
+        "wakeup for the whole database wants",
+    )
     run_p.add_argument("--no-post", action="store_true", help="do not post the summary to Discord")
     run_p.add_argument("--force", action="store_true", help="run even if the assignment is paused")
 
@@ -183,6 +198,52 @@ def _money(price: float | None, currency: str | None = None) -> str:
     return f"{price:,.2f} {currency}" if currency else f"{price:,.2f}"
 
 
+def _run_exit_code(outcome: RunOutcome, *, posting: bool, log: Callable[[str], None]) -> int:
+    if not posting:
+        return 0 if outcome.usable else 1
+    if not outcome.posted:
+        print("track: error: the summary could not be posted", file=sys.stderr)
+        return 3
+    if not outcome.usable:
+        log("track: nothing usable found this run (summary posted anyway)")
+        return 1
+    return 0
+
+
+def _run_all_active(store: Store, args: argparse.Namespace, log: Callable[[str], None]) -> int:
+    """Run every active assignment, then report the worst thing that happened.
+
+    A scheduler that owns one wakeup for the whole database needs this to be
+    one command, and it needs one exit code out of several runs. An unposted
+    summary dominates a merely empty one: it is the outcome nobody hears
+    about otherwise, and one silent assignment out of three is still a silent
+    assignment. A failing assignment never stops the ones after it.
+    """
+    active = [a for a in store.list_assignments() if a.status == "active"]
+    if not active:
+        log("track: no active assignments")
+        return 1
+    worst = 1
+    any_usable = False
+    for assignment in active:
+        log(f"track: running {assignment.id} ({assignment.text[:60]})")
+        try:
+            outcome = run_assignment(store, assignment, warn=log, post=not args.no_post)
+        except TrackError as exc:
+            print(f"track: error: {assignment.id} failed: {exc}", file=sys.stderr)
+            worst = max(worst, 3)
+            continue
+        print(outcome.summary)
+        code = _run_exit_code(outcome, posting=not args.no_post, log=log)
+        if code == 3:
+            worst = 3
+        if outcome.usable:
+            any_usable = True
+    if worst == 3:
+        return 3
+    return 0 if any_usable else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     try:
@@ -198,6 +259,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     def vlog(message: str) -> None:
         if args.verbose and not args.quiet:
             print(message, file=sys.stderr)
+
+    if args.command == "run" and bool(args.assignment_id) == bool(args.all_active):
+        print("track: error: run takes either an assignment id or --all-active", file=sys.stderr)
+        return 2
 
     interval_seconds = 0
     if args.command == "add":
@@ -233,7 +298,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     wake_on=args.wake_on,
                 )
                 where = f" in {assignment.market}" if assignment.market else ""
-                log(f"tracking {assignment.id}: {assignment.text!r}{where} every {args.interval}")
+                cadence = (
+                    "on demand only (not scheduled)"
+                    if args.no_schedule
+                    else f"every {args.interval}"
+                )
+                log(f"tracking {assignment.id}: {assignment.text!r}{where} {cadence}")
                 if not assignment.market:
                     log(
                         "track: warning: no --market set, so scouts will return whatever "
@@ -282,7 +352,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"  every {assignment.interval_seconds}s via "
                     f"{assignment.backend or 'no schedule'}"
                     f" · {assignment.runs_count} runs"
-                    f" · ${store.total_cost(assignment.id):.3f} spent"
+                    f" · ~${store.total_cost(assignment.id):.2f} of model usage"
                 )
                 print(f"sources ({len(sources)}):")
                 for s in sources:
@@ -316,6 +386,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
 
             if args.command == "run":
+                if args.all_active:
+                    return _run_all_active(store, args, log)
                 assignment = _require(store, args.assignment_id)
                 if assignment.status != "active" and not args.force:
                     print(
@@ -326,17 +398,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     return 1
                 outcome = run_assignment(store, assignment, warn=log, post=not args.no_post)
                 print(outcome.summary)
-                if args.no_post:
-                    return 0 if outcome.usable else 1
-                if not outcome.posted:
-                    print(
-                        "track: error: the summary could not be posted", file=sys.stderr
-                    )
-                    return 3
-                if not outcome.usable:
-                    log("track: nothing usable found this run (summary posted anyway)")
-                    return 1
-                return 0
+                return _run_exit_code(outcome, posting=not args.no_post, log=log)
 
             if args.command == "unschedule":
                 assignment = _require(store, args.assignment_id)
