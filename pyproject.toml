@@ -24,6 +24,11 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+# `track` itself has no runtime dependencies, and the machine that runs the
+# scheduled research should not acquire any. Whatever the web interface needs
+# goes here, so `pip install track` stays stdlib-only and `track run` cannot
+# be broken by a web framework it never imports.
+web = []
 dev = [
   "pytest>=8.0,<10",
   "pytest-cov>=5.0,<7",

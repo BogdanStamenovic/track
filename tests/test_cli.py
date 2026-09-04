@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import types
 from pathlib import Path
 
 import pytest
 
-from track.cli import main
+from track.cli import SUBCOMMANDS, _build_parser, _split_web_args, main
 from track.engine import RunOutcome
 from track.errors import TrackError
 from track.scheduler import ScheduleResult
@@ -589,3 +590,85 @@ def test_show_lists_what_has_been_retired(capsys, db: Path) -> None:
     assert "retired (1)" in out
     assert "[gone]" in out
     assert "oglas je prodat" in out
+
+
+# -- the web half --------------------------------------------------------
+
+
+def test_web_missing_is_an_error_not_a_crash(capsys, db: Path, monkeypatch) -> None:
+    """Every scheduler box installs track without the web extra."""
+    monkeypatch.setattr(
+        "track.cli.importlib.import_module",
+        lambda name: (_ for _ in ()).throw(ImportError(f"No module named {name!r}")),
+    )
+    code = main(["--db", str(db), "web"])
+    err = capsys.readouterr().err
+
+    assert code == 1
+    assert "not available" in err
+    assert ".[web]" in err
+
+
+def test_a_web_module_without_an_entry_point_is_an_error_not_a_crash(
+    capsys, db: Path, monkeypatch
+) -> None:
+    """A half-written track.web must not raise out of `track web`."""
+    monkeypatch.setattr(
+        "track.cli.importlib.import_module", lambda name: types.SimpleNamespace()
+    )
+
+    assert main(["--db", str(db), "web"]) == 1
+    assert "not available" in capsys.readouterr().err
+
+
+def test_the_web_module_owns_its_own_flags(capsys, db: Path, monkeypatch) -> None:
+    """So adding one never means editing cli.py."""
+    seen: dict[str, object] = {}
+
+    def fake_main(argv, *, db_path, log):
+        seen["argv"] = argv
+        seen["db_path"] = db_path
+        return 0
+
+    monkeypatch.setattr(
+        "track.cli.importlib.import_module",
+        lambda name: types.SimpleNamespace(main=fake_main),
+    )
+
+    assert main(["--db", str(db), "web", "--port", "8080", "--open"]) == 0
+    assert seen["argv"] == ["--port", "8080", "--open"]
+    assert Path(str(seen["db_path"])) == db
+
+
+def test_run_still_works_with_the_web_subcommand_registered(db: Path, monkeypatch) -> None:
+    """The 06:05 run is the thing that must not break."""
+    assignment_id = _add(db, "--notify", "x")
+    monkeypatch.setattr("track.cli.run_assignment", lambda *a, **k: _result())
+
+    assert main(["--db", str(db), "run", assignment_id, "--no-post"]) == 0
+
+
+def test_the_verb_list_used_for_splitting_matches_the_parser() -> None:
+    """_split_web_args works off a hand-written set; this pins it to reality."""
+    parser = _build_parser()
+    registered = {
+        name
+        for action in parser._subparsers._group_actions  # type: ignore[union-attr]
+        for name in action.choices
+    }
+    assert registered == set(SUBCOMMANDS)
+
+
+def test_a_value_that_reads_like_a_verb_is_not_mistaken_for_one(capsys, db: Path) -> None:
+    """`--db /tmp/web` must not turn into `track web`."""
+    tokens, extra = _split_web_args(["--db", "web", "list"], SUBCOMMANDS)
+    assert extra == []
+    assert tokens == ["--db", "web", "list"]
+
+
+def test_everything_after_the_web_verb_is_passed_through_untouched() -> None:
+    tokens, extra = _split_web_args(
+        ["--db", "x.db", "web", "--port", "8080", "--open"], SUBCOMMANDS
+    )
+    assert tokens == ["--db", "x.db", "web"]
+    assert extra == ["--port", "8080", "--open"]

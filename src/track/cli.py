@@ -31,6 +31,7 @@ assignment out of three is still a silent assignment.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import re
@@ -66,6 +67,41 @@ def _parse_interval(value: str) -> int:
     if not match or int(match.group(1)) <= 0:
         raise _UsageError(f"invalid --interval {value!r} (expected e.g. 6h, 30m, 86400)")
     return int(match.group(1)) * _INTERVAL_UNITS[match.group(2) or "s"]
+
+
+# Every verb the parser accepts. Duplicated from `_build_parser` rather than
+# read back out of argparse's internals, and pinned to it by a test, so the
+# two drifting fails the suite instead of quietly mis-splitting an argument
+# list.
+SUBCOMMANDS = frozenset(
+    {"add", "list", "show", "sources", "run", "web", "unschedule", "remove", "pause", "resume"}
+)
+
+# Of the flags accepted before a subcommand, only --db takes a value -- the
+# one case where a bare "web" in the argument list is a value, not the verb.
+_VALUE_FLAGS = {"--db"}
+
+
+def _split_web_args(
+    argv: list[str], commands: frozenset[str]
+) -> tuple[list[str], list[str]]:
+    """Peel off everything after a literal `web` verb.
+
+    `track web` hands its whole tail to a module this file knows nothing
+    about, which argparse cannot express: REMAINDER still lets the parent
+    parser claim a leading `--port`, and `nargs="*"` reorders the tail. So
+    the split happens first, on the one verb that needs it.
+
+    The scan stops at the first token that names a subcommand, so a value
+    that happens to read like one -- `track add "..." --notify web` -- is not
+    mistaken for the verb.
+    """
+    for i, token in enumerate(argv):
+        if i and argv[i - 1] in _VALUE_FLAGS:
+            continue
+        if token in commands:
+            return (argv[: i + 1], argv[i + 1 :]) if token == "web" else (argv, [])
+    return argv, []
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -137,6 +173,16 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--no-post", action="store_true", help="do not post the summary to Discord")
     run_p.add_argument("--force", action="store_true", help="run even if the assignment is paused")
 
+    sub.add_parser(
+        "web",
+        help="serve the findings as a browsable site",
+        description="Everything after `web` is passed through to the web module.",
+    )
+    # No flags declared on purpose: `track web` owns its own, so adding one
+    # never means editing this file. They are split off before argparse sees
+    # them (see `_split_web_args`) rather than declared as REMAINDER, which
+    # leaks a leading `--port` to the parent parser as an unknown argument.
+
     unschedule_p = sub.add_parser(
         "unschedule",
         help="cancel the recurring wakeup but keep the assignment active "
@@ -196,6 +242,40 @@ def _money(price: float | None, currency: str | None = None) -> str:
     if price is None:
         return "?"
     return f"{price:,.2f} {currency}" if currency else f"{price:,.2f}"
+
+
+def _serve_web(store: Store, argv: list[str], log: Callable[[str], None]) -> int:
+    """Hand off to the web module, which owns everything past `track web`.
+
+    Imported here rather than at module scope so that a track installed
+    without its web extra -- the shape on any machine that only runs the
+    scheduled research -- is unaffected by the web half existing at all.
+    `track` has no runtime dependencies and the unattended run depends on
+    that staying true.
+
+    Resolved through importlib rather than a `from .web import main`, because
+    the module is genuinely optional and genuinely absent on those machines.
+    A static import would also tie this file's type check to the state of a
+    half maintained separately; a partially written `track.web` must not be
+    able to turn `track run` red.
+
+    The contract is one function:
+
+        def main(argv: list[str], *, db_path: Path, log: Callable[[str], None]) -> int
+
+    where `argv` is everything the user typed after `web`, untouched.
+    """
+    try:
+        web = importlib.import_module("track.web")
+        web_main = web.main
+    except (ImportError, AttributeError) as exc:
+        print(
+            f"track: error: the web interface is not available ({exc}). "
+            "Install it with: pip install -e '.[web]'",
+            file=sys.stderr,
+        )
+        return 1
+    return int(web_main(argv, db_path=Path(store.db_path), log=log))
 
 
 def _provenance(finding: Finding, status: ListingStatus | None) -> str:
@@ -270,8 +350,10 @@ def _run_all_active(store: Store, args: argparse.Namespace, log: Callable[[str],
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    tokens, web_args = _split_web_args(tokens, SUBCOMMANDS)
     try:
-        args = parser.parse_args(argv)
+        args = parser.parse_args(tokens)
     except _UsageError as exc:
         print(f"track: error: {exc}", file=sys.stderr)
         return 2
@@ -426,6 +508,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         f"median {_money(stat.median, stat.currency)}"
                     )
                 return 0
+
+            if args.command == "web":
+                return _serve_web(store, web_args, log)
 
             if args.command == "run":
                 if args.all_active:
