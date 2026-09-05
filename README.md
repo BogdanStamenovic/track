@@ -39,6 +39,8 @@ track sources <assignment-id> [--json]
 track run <assignment-id> | --all-active | --slot HH:MM [--no-post] [--force]
 track reschedule <assignment-id> [--at HH:MM | --interval P | --advise]
                                  [--then-poweroff | --no-then-poweroff]
+                                 [--wake-backend shell|rtcwake|wol]
+                                 [--wake-target MAC] [--wake-on HOST]
 track unschedule <assignment-id>
 track pause <assignment-id>
 track resume <assignment-id>
@@ -57,7 +59,7 @@ track remove <assignment-id>
 | `--wake-backend` | `shell` for a machine that stays up; `rtcwake`/`wol` to resume a sleeping one first |
 | `--wake-target` | MAC address, for `--wake-backend wol` |
 | `--wake-on` | wake origin name of the machine that should run the check |
-| `reschedule` | change when an existing assignment is checked, keeping its history — the only way to move one into or out of a slot |
+| `reschedule` | change when an existing assignment is checked, and how its machine is woken, keeping its history — the only way to move one into or out of a slot. Every option is left alone when not given |
 | `unschedule` | drop track's own recurring wakeup but keep the assignment runnable, for when an external scheduler owns the timing |
 | `--no-post` | run without posting to Discord |
 | `--all-active` | run every active assignment in turn, for a scheduler that owns one wakeup for the whole database |
@@ -495,8 +497,24 @@ a slot, which is the usual case — the assignments worth putting on a morning
 schedule are the ones that have been running a while:
 
 ```
-track reschedule 10ee961f --at 08:00 --then-poweroff
+track reschedule 10ee961f --at 08:00 --then-poweroff \
+    --wake-backend wol --wake-target <MAC> --wake-on archserver
 ```
+
+The `--wake-*` options matter here specifically because of the poweroff. A
+slot that shuts the machine down is a slot that has to be able to turn it back
+on, so an assignment left on the `shell` backend schedules a run on a box that
+nothing will wake — which fails silently at exactly the moment it was meant to
+matter. `wol` without a target is refused rather than stored, and the check is
+made against the state the assignment ends up in, so setting the backend on an
+assignment that already has a MAC is fine.
+
+That produces two `wake` tasks, and which machine owns each one is
+load-bearing: the resume task is **server-owned**, because it is the server
+that sends the magic packet, and the run task names the machine being woken
+(`--on archserver`), because `wake` otherwise fires shell tasks on the server.
+A resume task owned by the box it is meant to wake can be fired by nobody, and
+still looks healthy in `wake list`.
 
 An explicit `--at` or `--interval` is a decision and skips the advisor
 entirely. So does `--no-advise`. If the advisor is unreachable or answers with
@@ -629,6 +647,13 @@ from deploying it that way, rather than assumptions:
   ten different times are ten wakeups, and if the machine powers off after
   each, ten sleep/wake cycles. Grouping only happens when the times are
   literally equal; track will not round 08:00 and 08:05 together for you.
+- **`wake` will not power the machine off while a person is connected.** Its
+  presence guard counts a logind session of `Class=user`, an attached tmux
+  client, and an interactive ssh login (`sshd: user@pts/N`; `@notty` and
+  detached tmux do not count, which is what lets agents run without blocking
+  it). So a slot that asks to power off will simply leave the box up on any
+  morning somebody is logged in. That is `wake`'s decision, not track's, and
+  track reports what it asked for rather than what happened.
 - **A slot's poweroff needs `wake`.** The systemd fallback has no equivalent
   of `--then poweroff` and refuses the request outright rather than pretending
   it worked. `wake`'s own poweroff runs `sudo -n systemctl poweroff` and so

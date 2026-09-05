@@ -1011,3 +1011,70 @@ def test_reschedule_with_nothing_to_change_is_a_usage_error(capsys, db: Path) ->
 
 def test_reschedule_of_an_unknown_assignment_is_a_failure(db: Path) -> None:
     assert main(["--db", str(db), "reschedule", "nope", "--at", "08:00"]) == 1
+
+
+def test_reschedule_can_change_how_the_machine_is_woken(monkeypatch, db: Path) -> None:
+    """Without this the whole feature is unusable on a box that powers off.
+
+    A slot armed on a `shell` assignment is a run scheduled on a machine
+    that nothing will turn on -- which fails silently at exactly the moment
+    it was supposed to matter.
+    """
+    assignment_id = _add(db, "--at", "08:00")
+
+    assert (
+        main([
+            "--db", str(db), "reschedule", assignment_id,
+            "--wake-backend", "wol", "--wake-target", "aa:bb:cc:dd:ee:ff",
+            "--wake-on", "archserver",
+        ])
+        == 0
+    )
+
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+    assert row is not None
+    assert (row.wake_backend, row.wake_target, row.wake_on) == (
+        "wol", "aa:bb:cc:dd:ee:ff", "archserver",
+    )
+    assert row.check_at == "08:00"  # untouched by a wake-only reschedule
+
+
+def test_wol_without_a_target_is_refused_by_reschedule(capsys, db: Path) -> None:
+    """Refused, not stored and discovered broken tomorrow morning."""
+    assignment_id = _add(db, "--at", "08:00")
+
+    assert main(["--db", str(db), "reschedule", assignment_id, "--wake-backend", "wol"]) == 2
+    assert "--wake-target" in capsys.readouterr().err
+
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+    assert row is not None
+    assert row.wake_backend == "shell"  # nothing was written
+
+
+def test_wol_is_allowed_when_the_target_is_already_stored(db: Path) -> None:
+    """Validated against the state it ends up in, not against the flags."""
+    assignment_id = _add(db, "--at", "08:00", "--wake-target", "aa:bb:cc:dd:ee:ff")
+
+    assert main(["--db", str(db), "reschedule", assignment_id, "--wake-backend", "wol"]) == 0
+
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+    assert row is not None
+    assert (row.wake_backend, row.wake_target) == ("wol", "aa:bb:cc:dd:ee:ff")
+
+
+def test_a_wake_only_reschedule_leaves_the_other_fields_alone(db: Path) -> None:
+    assignment_id = _add(db, "--at", "08:00", "--then-poweroff")
+
+    assert main(["--db", str(db), "reschedule", assignment_id, "--wake-on", "archserver"]) == 0
+
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+    assert row is not None
+    assert row.wake_on == "archserver"
+    assert row.wake_backend == "shell"
+    assert row.wake_target is None
+    assert row.poweroff_after
+    assert row.check_at == "08:00"

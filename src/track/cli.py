@@ -248,6 +248,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="power the machine down after this assignment's slot has run; "
         "--no-then-poweroff turns it back off. Left alone if neither is given",
     )
+    # Same spelling and meaning as on `add`, but defaulting to None rather
+    # than "shell": on `add` an unset backend means "the default", here it
+    # means "do not touch what is stored".
+    resched_p.add_argument(
+        "--wake-backend",
+        choices=["shell", "rtcwake", "wol"],
+        default=None,
+        help="shell runs on a machine that is already up; rtcwake/wol resume a "
+        "sleeping one first. Left alone if not given",
+    )
+    resched_p.add_argument("--wake-target", help="MAC address, for --wake-backend wol")
+    resched_p.add_argument(
+        "--wake-on",
+        help="wake origin name of the machine that should run the check; without it "
+        "the wake server runs it, which is wrong when wol wakes a different box",
+    )
 
     unschedule_p = sub.add_parser(
         "unschedule",
@@ -577,16 +593,43 @@ def _reschedule(store: Store, args: argparse.Namespace, log: Callable[[str], Non
     if args.check_at and args.interval:
         print("track: error: --interval and --at are alternatives", file=sys.stderr)
         return 2
-    if not (args.check_at or args.interval or args.advise or args.then_poweroff is not None):
+    wake_change = args.wake_backend or args.wake_target or args.wake_on
+    if not (
+        args.check_at
+        or args.interval
+        or args.advise
+        or args.then_poweroff is not None
+        or wake_change
+    ):
         print(
-            "track: error: reschedule needs --at, --interval, --advise "
-            "or --then-poweroff/--no-then-poweroff",
+            "track: error: reschedule needs --at, --interval, --advise, "
+            "--then-poweroff/--no-then-poweroff, or a --wake-* option",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Validated against the state the assignment will END UP in, not against
+    # the flags alone: `--wake-backend wol` on an assignment that already has
+    # a MAC is fine, and a `--wake-target` on its own must not be able to
+    # leave a wol assignment targetless. Checked before anything is written,
+    # so a rejected reschedule changes nothing.
+    resulting_backend = args.wake_backend or before.wake_backend or "shell"
+    resulting_target = args.wake_target or before.wake_target
+    if resulting_backend == "wol" and not resulting_target:
+        print(
+            "track: error: --wake-backend wol needs --wake-target <MAC address>",
             file=sys.stderr,
         )
         return 2
 
     if args.then_poweroff is not None:
         store.set_poweroff_after(before.id, args.then_poweroff)
+    store.set_wake_config(
+        before.id,
+        wake_backend=args.wake_backend,
+        wake_target=args.wake_target,
+        wake_on=args.wake_on,
+    )
 
     if args.check_at or args.interval or args.advise:
         # `_resolve_cadence` reads args.text, which reschedule does not have,
@@ -625,10 +668,18 @@ def _reschedule(store: Store, args: argparse.Namespace, log: Callable[[str], Non
 
 
 def _cadence_phrase_for(assignment: Assignment) -> str:
+    parts = []
     if assignment.check_at:
-        tail = ", powering off afterwards" if assignment.poweroff_after else ""
-        return f"daily at {assignment.check_at}{tail}"
-    return f"every {assignment.interval_seconds}s"
+        parts.append(f"daily at {assignment.check_at}")
+    else:
+        parts.append(f"every {assignment.interval_seconds}s")
+    backend = assignment.wake_backend or "shell"
+    if backend != "shell":
+        where = f" on {assignment.wake_on}" if assignment.wake_on else ""
+        parts.append(f"waking the machine by {backend}{where}")
+    if assignment.poweroff_after:
+        parts.append("powering off afterwards")
+    return ", ".join(parts)
 
 
 def _run_slot(store: Store, args: argparse.Namespace, log: Callable[[str], None]) -> int:

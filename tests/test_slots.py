@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 from conftest import completed
 
-from track import slots
+from track import scheduler, slots
 from track.errors import SchedulerError
 from track.store import Store
 
@@ -417,3 +417,49 @@ def test_drift_is_measured_the_short_way_round_midnight() -> None:
 
     an_hour_before = at(2026, 9, 6, 23, 0, 0)
     assert slots.drifted("00:15", now=an_hour_before)
+
+
+# -- who owns which task --------------------------------------------------
+
+
+def test_the_resume_task_is_server_owned_and_the_run_task_is_not(store: Store) -> None:
+    """The ownership split, which is load-bearing and silently breakable.
+
+    `wake` fires a shell task on the server unless the task names an owner,
+    so the run task must name the machine being woken. The resume task must
+    NOT: it is the server that sends the magic packet, and a resume task
+    owned by the box it is meant to wake can be fired by nobody. Such a task
+    still looks perfectly healthy in `wake list`.
+    """
+    _assignment(
+        store, "a laptop", check_at="08:00", wake_backend="wol",
+        wake_target="aa:bb:cc:dd:ee:ff", wake_on="archserver",
+    )
+    calls, runner = _recording()
+
+    slots.arm(
+        store, "08:00", ["track", "run", "--slot", "08:00"],
+        runner=runner, wake_available=True, supports_every=True, now=NOON,
+    )
+
+    resume, run = _add_calls(calls)
+    assert _flag(resume, "--backend") == "wol"
+    assert "--on" not in resume
+    assert _flag(run, "--backend") == "shell"
+    assert _flag(run, "--on") == "archserver"
+
+
+def test_the_run_task_waits_for_the_machine_to_come_up(store: Store) -> None:
+    _assignment(
+        store, "a laptop", check_at="08:00", wake_backend="wol",
+        wake_target="aa:bb:cc:dd:ee:ff", wake_on="archserver",
+    )
+    calls, runner = _recording()
+
+    slots.arm(
+        store, "08:00", ["track", "run", "--slot", "08:00"],
+        runner=runner, wake_available=True, supports_every=True, now=NOON,
+    )
+
+    resume, run = _add_calls(calls)
+    assert int(_flag(run, "--at")) - int(_flag(resume, "--at")) == scheduler.RESUME_GRACE_SECONDS

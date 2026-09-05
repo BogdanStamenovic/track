@@ -472,6 +472,36 @@ class Store:
         )
         self._conn.commit()
 
+    def set_wake_config(
+        self,
+        assignment_id: str,
+        *,
+        wake_backend: str | None = None,
+        wake_target: str | None = None,
+        wake_on: str | None = None,
+    ) -> None:
+        """Change how this assignment's machine is woken, field by field.
+
+        Each field is left alone when not given rather than defaulted, so
+        setting one cannot silently clear another -- a reschedule that
+        changed the backend and wiped the MAC with it would arm a wol task
+        with nothing to wake.
+        """
+        updates = {
+            "wake_backend": wake_backend,
+            "wake_target": wake_target,
+            "wake_on": wake_on,
+        }
+        given = {name: value for name, value in updates.items() if value is not None}
+        if not given:
+            return
+        assignments = ", ".join(f"{name} = ?" for name in given)
+        self._conn.execute(
+            f"UPDATE assignments SET {assignments} WHERE id = ?",
+            (*given.values(), assignment_id),
+        )
+        self._conn.commit()
+
     def set_interval(self, assignment_id: str, interval_seconds: int) -> None:
         self._conn.execute(
             "UPDATE assignments SET interval_seconds = ? WHERE id = ?",
