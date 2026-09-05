@@ -37,6 +37,8 @@ track list [--json]
 track show <assignment-id> [--limit N] [--json]
 track sources <assignment-id> [--json]
 track run <assignment-id> | --all-active | --slot HH:MM [--no-post] [--force]
+track reschedule <assignment-id> [--at HH:MM | --interval P | --advise]
+                                 [--then-poweroff | --no-then-poweroff]
 track unschedule <assignment-id>
 track pause <assignment-id>
 track resume <assignment-id>
@@ -55,6 +57,7 @@ track remove <assignment-id>
 | `--wake-backend` | `shell` for a machine that stays up; `rtcwake`/`wol` to resume a sleeping one first |
 | `--wake-target` | MAC address, for `--wake-backend wol` |
 | `--wake-on` | wake origin name of the machine that should run the check |
+| `reschedule` | change when an existing assignment is checked, keeping its history — the only way to move one into or out of a slot |
 | `unschedule` | drop track's own recurring wakeup but keep the assignment runnable, for when an external scheduler owns the timing |
 | `--no-post` | run without posting to Discord |
 | `--all-active` | run every active assignment in turn, for a scheduler that owns one wakeup for the whole database |
@@ -487,6 +490,14 @@ $ track show 5d98f49e
   08:00 slot: 2 assignment(s), shared with c71e05b4; powers the machine off afterwards
 ```
 
+`track reschedule` moves an assignment already carrying history into or out of
+a slot, which is the usual case — the assignments worth putting on a morning
+schedule are the ones that have been running a while:
+
+```
+track reschedule 10ee961f --at 08:00 --then-poweroff
+```
+
 An explicit `--at` or `--interval` is a decision and skips the advisor
 entirely. So does `--no-advise`. If the advisor is unreachable or answers with
 something that is not a time, `track add` says so and falls back to the flat
@@ -598,9 +609,9 @@ from deploying it that way, rather than assumptions:
   that knows wake's CLI shape; if that contract changes, nothing else does.
 - **The advisor picks an hour, not a cadence.** It answers one question —
   what time of day — and every slot is daily. It cannot say "twice a week" or
-  "every three hours", and it is asked once, at `track add`, never again as
-  the category changes. Re-advising an existing assignment means removing it
-  and adding it back.
+  "every three hours". It is asked once, at `track add`, and never again on
+  its own as the category changes; `track reschedule --advise` asks it again
+  when you decide to.
 - **The advisor's reasoning is a claim, not a measurement.** It is a Sonnet
   session's opinion about when a category's sellers post, and nothing in
   track checks it against when findings actually turned up. It is stored and

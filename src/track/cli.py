@@ -87,7 +87,10 @@ def _parse_interval(value: str) -> int:
 # two drifting fails the suite instead of quietly mis-splitting an argument
 # list.
 SUBCOMMANDS = frozenset(
-    {"add", "list", "show", "sources", "run", "web", "unschedule", "remove", "pause", "resume"}
+    {
+        "add", "list", "show", "sources", "run", "web",
+        "reschedule", "unschedule", "remove", "pause", "resume",
+    }
 )
 
 # Of the flags accepted before a subcommand, only --db takes a value -- the
@@ -225,6 +228,26 @@ def _build_parser() -> argparse.ArgumentParser:
     # never means editing this file. They are split off before argparse sees
     # them (see `_split_web_args`) rather than declared as REMAINDER, which
     # leaks a leading `--port` to the parent parser as an unknown argument.
+
+    resched_p = sub.add_parser(
+        "reschedule",
+        help="change when an existing assignment is checked, keeping its history",
+    )
+    resched_p.add_argument("assignment_id")
+    resched_p.add_argument("--at", dest="check_at", help="check daily at this local time")
+    resched_p.add_argument("--interval", help="check on this period instead, e.g. 6h")
+    resched_p.add_argument(
+        "--advise",
+        action="store_true",
+        help="ask the advisor for a time, as `add` does when given neither --at nor --interval",
+    )
+    resched_p.add_argument(
+        "--then-poweroff",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="power the machine down after this assignment's slot has run; "
+        "--no-then-poweroff turns it back off. Left alone if neither is given",
+    )
 
     unschedule_p = sub.add_parser(
         "unschedule",
@@ -541,6 +564,73 @@ def _schedule_notes(store: Store, assignment: Assignment) -> list[str]:
     return notes
 
 
+def _reschedule(store: Store, args: argparse.Namespace, log: Callable[[str], None]) -> int:
+    """Move an existing assignment to a different check time, keeping its history.
+
+    This exists because `check_at` was otherwise only settable at `add`, which
+    meant an assignment already carrying runs of history could not join a slot
+    without being deleted and re-created. That is the whole use case -- the
+    assignments worth putting on a morning schedule are the ones that have
+    been running a while.
+    """
+    before = _require(store, args.assignment_id)
+    if args.check_at and args.interval:
+        print("track: error: --interval and --at are alternatives", file=sys.stderr)
+        return 2
+    if not (args.check_at or args.interval or args.advise or args.then_poweroff is not None):
+        print(
+            "track: error: reschedule needs --at, --interval, --advise "
+            "or --then-poweroff/--no-then-poweroff",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.then_poweroff is not None:
+        store.set_poweroff_after(before.id, args.then_poweroff)
+
+    if args.check_at or args.interval or args.advise:
+        # `_resolve_cadence` reads args.text, which reschedule does not have,
+        # and args.no_advise/no_schedule, which it does not offer. Filling
+        # them in here keeps one implementation of "who decides the cadence"
+        # rather than a second that can drift from it.
+        proxy = argparse.Namespace(
+            text=before.text,
+            market=before.market,
+            check_at=args.check_at,
+            interval=args.interval,
+            no_advise=False,
+            no_schedule=False,
+        )
+        try:
+            cadence = _resolve_cadence(proxy, log)
+        except (TrackError, _UsageError) as exc:
+            print(f"track: error: {exc}", file=sys.stderr)
+            return 2
+        store.set_check_at(
+            before.id, cadence.check_at, rationale=cadence.rationale, source=cadence.source
+        )
+        store.set_interval(before.id, cadence.interval_seconds)
+        # Leave whatever was scheduling it before, with the row already
+        # updated -- so an old slot is rebuilt without this assignment
+        # instead of around it.
+        _disarm(store, before, log)
+        if cadence.rationale:
+            log(f"  why {cadence.check_at}: {cadence.rationale}")
+
+    after = _require(store, before.id)
+    if after.status == "active":
+        _arm(store, after, log)
+    log(f"rescheduled {after.id}: {_cadence_phrase_for(after)}")
+    return 0
+
+
+def _cadence_phrase_for(assignment: Assignment) -> str:
+    if assignment.check_at:
+        tail = ", powering off afterwards" if assignment.poweroff_after else ""
+        return f"daily at {assignment.check_at}{tail}"
+    return f"every {assignment.interval_seconds}s"
+
+
 def _run_slot(store: Store, args: argparse.Namespace, log: Callable[[str], None]) -> int:
     """Run one daily slot: every assignment due at this time, in sequence.
 
@@ -784,6 +874,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 outcome = run_assignment(store, assignment, warn=log, post=not args.no_post)
                 print(outcome.summary)
                 return _run_exit_code(outcome, posting=not args.no_post, log=log)
+
+            if args.command == "reschedule":
+                return _reschedule(store, args, log)
 
             # The row is changed *before* _disarm in all three, not after.
             # A slot's wake task is shared, and _disarm re-arms it for

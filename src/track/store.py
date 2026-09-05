@@ -465,6 +465,20 @@ class Store:
         )
         self._conn.commit()
 
+    def set_poweroff_after(self, assignment_id: str, poweroff_after: bool) -> None:
+        self._conn.execute(
+            "UPDATE assignments SET poweroff_after = ? WHERE id = ?",
+            (int(poweroff_after), assignment_id),
+        )
+        self._conn.commit()
+
+    def set_interval(self, assignment_id: str, interval_seconds: int) -> None:
+        self._conn.execute(
+            "UPDATE assignments SET interval_seconds = ? WHERE id = ?",
+            (interval_seconds, assignment_id),
+        )
+        self._conn.commit()
+
     def set_schedule(
         self,
         assignment_id: str,

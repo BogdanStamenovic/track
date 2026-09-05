@@ -913,3 +913,101 @@ def test_unscheduling_a_member_detaches_it_but_keeps_the_reasoning(
     assert row.status == "active"
     assert row.check_at is None
     assert row.check_at_rationale == "sellers post overnight"
+
+
+# -- reschedule -----------------------------------------------------------
+
+
+def test_reschedule_moves_an_assignment_into_a_slot_keeping_its_history(
+    monkeypatch, db: Path
+) -> None:
+    """The point of the verb: history survives the move.
+
+    An assignment worth putting on a morning schedule is one that has been
+    running a while, and before this the only way to set a check time was to
+    delete it and add it back.
+    """
+    assignment_id = _add(db, "--interval", "6h")
+    with Store(db) as store:
+        store.mark_ran(assignment_id)
+        store.mark_ran(assignment_id)
+
+    assert main(["--db", str(db), "reschedule", assignment_id, "--at", "8:00"]) == 0
+
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+    assert row is not None
+    assert row.check_at == "08:00"
+    assert row.check_at_source == "user"
+    assert row.runs_count == 2
+
+
+def test_reschedule_can_turn_the_poweroff_on_and_off(monkeypatch, db: Path) -> None:
+    assignment_id = _add(db, "--at", "08:00")
+
+    assert main(["--db", str(db), "reschedule", assignment_id, "--then-poweroff"]) == 0
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+    assert row is not None and row.poweroff_after
+
+    assert main(["--db", str(db), "reschedule", assignment_id, "--no-then-poweroff"]) == 0
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+    assert row is not None and not row.poweroff_after
+
+
+def test_reschedule_can_ask_the_advisor(monkeypatch, db: Path) -> None:
+    asked = _advice(monkeypatch, "21:00", "evening listings")
+    assignment_id = _add(db, "--interval", "6h")
+
+    assert main(["--db", str(db), "reschedule", assignment_id, "--advise"]) == 0
+
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+    assert row is not None
+    assert row.check_at == "21:00"
+    assert row.check_at_source == "agent"
+    assert row.check_at_rationale == "evening listings"
+    assert asked == [row.text]
+
+
+def test_moving_out_of_a_slot_rebuilds_the_slot_without_it(monkeypatch, db: Path) -> None:
+    armed: list[tuple[str, int]] = []
+
+    def recording_arm(store, check_at, run_cmd, **kwargs):
+        armed.append((check_at, len(store.slot_members(check_at))))
+        return fake_arm(store, check_at, run_cmd, **kwargs)
+
+    monkeypatch.setattr("track.cli.slots.arm", recording_arm)
+    _add(db, "--at", "08:00")
+    mover = _add(db, "--at", "08:00")
+    armed.clear()
+
+    assert main(["--db", str(db), "reschedule", mover, "--at", "19:00"]) == 0
+
+    # The 08:00 slot is rebuilt for the one that stayed, and 19:00 gains one.
+    assert ("08:00", 1) in armed
+    assert ("19:00", 1) in armed
+
+
+def test_reschedule_back_to_an_interval_leaves_the_slot(monkeypatch, db: Path) -> None:
+    assignment_id = _add(db, "--at", "08:00")
+
+    assert main(["--db", str(db), "reschedule", assignment_id, "--interval", "3h"]) == 0
+
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+        assert store.slot_members("08:00") == []
+    assert row is not None
+    assert row.check_at is None
+    assert row.interval_seconds == 3 * 3600
+
+
+def test_reschedule_with_nothing_to_change_is_a_usage_error(capsys, db: Path) -> None:
+    assignment_id = _add(db)
+    assert main(["--db", str(db), "reschedule", assignment_id]) == 2
+    assert "needs --at" in capsys.readouterr().err
+
+
+def test_reschedule_of_an_unknown_assignment_is_a_failure(db: Path) -> None:
+    assert main(["--db", str(db), "reschedule", "nope", "--at", "08:00"]) == 1
