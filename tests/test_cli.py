@@ -1078,3 +1078,20 @@ def test_a_wake_only_reschedule_leaves_the_other_fields_alone(db: Path) -> None:
     assert row.wake_target is None
     assert row.poweroff_after
     assert row.check_at == "08:00"
+
+
+def test_rescheduling_within_the_same_slot_arms_it_once(monkeypatch, db: Path) -> None:
+    """Twice is idempotent but reads as a bug to whoever is checking the output."""
+    armed: list[str] = []
+
+    def recording_arm(store, check_at, run_cmd, **kwargs):
+        armed.append(check_at)
+        return fake_arm(store, check_at, run_cmd, **kwargs)
+
+    monkeypatch.setattr("track.cli.slots.arm", recording_arm)
+    assignment_id = _add(db, "--at", "08:00")
+    armed.clear()
+
+    assert main(["--db", str(db), "reschedule", assignment_id, "--at", "08:00",
+                 "--then-poweroff"]) == 0
+    assert armed == ["08:00"]

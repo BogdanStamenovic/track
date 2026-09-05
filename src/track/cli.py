@@ -655,8 +655,13 @@ def _reschedule(store: Store, args: argparse.Namespace, log: Callable[[str], Non
         store.set_interval(before.id, cadence.interval_seconds)
         # Leave whatever was scheduling it before, with the row already
         # updated -- so an old slot is rebuilt without this assignment
-        # instead of around it.
-        _disarm(store, before, log)
+        # instead of around it. Skipped when the slot has not changed:
+        # there is nothing to detach from, and _disarm would re-arm the slot
+        # that the _arm below is about to re-arm anyway, which costs a
+        # redundant `wake add` and prints the slot line twice to whoever is
+        # reading the output to check the change took.
+        if before.check_at != cadence.check_at:
+            _disarm(store, before, log)
         if cadence.rationale:
             log(f"  why {cadence.check_at}: {cadence.rationale}")
 
