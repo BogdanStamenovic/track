@@ -657,7 +657,13 @@ from deploying it that way, rather than assumptions:
   path to a two-line `exec ownbox "$@"` shim into a task, which exited 127 at
   06:02 having done nothing, while `--then poweroff` still took the box down.
   Re-arming from a shell whose PATH differs is still the way to change which
-  binary a task runs.
+  binary a task runs — and *which* working copy you arm from is a real choice,
+  not a detail. Arming from a development checkout points the task at a tree
+  somebody edits; an editor mid-save at 06:02 is a run that fails with nobody
+  watching. Arming from the installed copy (here, `ownbox`'s, which only moves
+  on an explicit `ownbox update`) gives the task a binary with fewer ways to
+  change under it. Both are absolute and both work; prefer the one nobody is
+  editing.
 - **`wake` will not power the machine off while a person is connected.** Its
   presence guard counts a logind session of `Class=user`, an attached tmux
   client, and an interactive ssh login (`sshd: user@pts/N`; `@notty` and
