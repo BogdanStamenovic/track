@@ -86,9 +86,95 @@ def slot_run_command(store: Store, check_at: str) -> list[str]:
     return _track_cmd(store) + ["run", "--slot", check_at]
 
 
+# Interpreters that make a script's behaviour depend on PATH again. `env` is
+# on this list for the same reason as the shells: `#!/usr/bin/env python`
+# looks python up at run time, so an absolute path to the script says nothing
+# about whether the script can start.
+_PATH_DEPENDENT_INTERPRETERS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "env"})
+
+
+def _survives_a_bare_path(candidate: Path) -> bool:
+    """Whether this file can still start with nothing useful on PATH.
+
+    An absolute path to an executable is not the same as an executable that
+    does not need PATH, which is what actually bit: `shutil.which("track")`
+    found `~/.local/bin/track`, an absolute path to a two-line ownbox shim
+    whose body is `exec ownbox "$@"`. `ownbox` is not on the PATH a wake task
+    fires with, so the scheduled command exited 127 -- and, because the task
+    also carried `--then poweroff`, would have powered the machine off having
+    done no research at all.
+
+    A `#!` line is read rather than the script executed: a probe that runs
+    the candidate costs a subprocess on a path that also runs inside tests,
+    and the shebang answers the question directly. A file with no shebang is
+    a real binary and needs nothing.
+    """
+    try:
+        with candidate.open("rb") as handle:
+            first_line = handle.readline(256)
+    except OSError:
+        return False
+    if not first_line.startswith(b"#!"):
+        return True
+    shebang = first_line[2:].decode("utf-8", "replace").split()
+    if not shebang:
+        return False
+    interpreter = Path(shebang[0])
+    if not interpreter.is_absolute():
+        return False
+    return interpreter.name not in _PATH_DEPENDENT_INTERPRETERS
+
+
+def _binary_candidates() -> list[Path]:
+    """Where a usable `track` might be, best first.
+
+    The console script sitting next to the running interpreter comes first
+    because it is the one actually executing this code, and because pip and
+    venv write it with an absolute shebang by construction. `which` comes
+    second: it answers "what would a login shell run", which is a different
+    and weaker question -- it can find a stale install, or a wrapper.
+
+    Ordering is a preference, not the safety. What makes the answer safe is
+    that every candidate has to pass `_survives_a_bare_path`; the order only
+    decides which of several working answers is chosen.
+    """
+    candidates = [Path(sys.executable).parent / "track"]
+    found = shutil.which("track")
+    if found:
+        candidates.append(Path(found))
+    candidates.append(Path(sys.argv[0]).resolve())
+    return candidates
+
+
+def track_binary(*, warn: Callable[[str], None] = lambda _m: None) -> str:
+    """The `track` to write into a scheduled task.
+
+    Resolved once, at schedule time, from the environment of whoever ran the
+    command -- the fired task inherits nothing, so a name that only works
+    inside a login shell is no use to it.
+    """
+    fallback: Path | None = None
+    for candidate in _binary_candidates():
+        if not candidate.exists():
+            continue
+        if _survives_a_bare_path(candidate):
+            return str(candidate)
+        if fallback is None:
+            fallback = candidate
+    if fallback is None:
+        # Nothing on disk matched. Scheduling something that cannot work is
+        # still better than not scheduling: the task's own failure is louder
+        # than a schedule that silently never existed.
+        return str(Path(sys.argv[0]).resolve())
+    warn(
+        f"track: warning: the only `track` found ({fallback}) needs PATH to start, "
+        "and a scheduled task has none -- the run may fail with exit 127"
+    )
+    return str(fallback)
+
+
 def _track_cmd(store: Store) -> list[str]:
-    track_bin = shutil.which("track") or str(Path(sys.argv[0]).resolve())
-    return [track_bin, "--db", str(Path(store.db_path).resolve())]
+    return [track_binary(), "--db", str(Path(store.db_path).resolve())]
 
 # Re-run source discovery every N runs even when sources are already known.
 # Without this the source list is frozen at whatever the very first scout

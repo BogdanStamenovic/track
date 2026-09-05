@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from track import engine
 from track.engine import (
     DEFAULT_SOURCE_LIMIT,
     REDISCOVER_EVERY,
@@ -687,3 +690,128 @@ def test_a_retired_listing_no_longer_sets_the_going_rate(store: Store, monkeypat
 
     assert outcome.findings[0].reference_price is None
     assert outcome.findings[0].score_basis == "cheapness"
+
+
+# -- resolving the binary a scheduled task will actually run ---------------
+#
+# The failure this guards against: `shutil.which("track")` returned an
+# absolute path to a two-line `#!/bin/sh` shim whose body was `exec ownbox
+# "$@"`. `ownbox` was not on the PATH a wake task fires with, so the armed
+# command exited 127 having done nothing -- while still carrying
+# `--then poweroff`, which would have powered the box off anyway.
+
+
+def _script(path: Path, shebang: str | None, body: str = "exit 0\n") -> Path:
+    path.write_text(f"#!{shebang}\n{body}" if shebang else body)
+    path.chmod(0o755)
+    return path
+
+
+def test_a_shell_wrapper_does_not_survive_a_bare_path(tmp_path: Path) -> None:
+    shim = _script(tmp_path / "track", "/bin/sh", "exec ownbox 'track' \"$@\"\n")
+    assert not engine._survives_a_bare_path(shim)
+
+
+def test_an_env_shebang_does_not_either(tmp_path: Path) -> None:
+    """`#!/usr/bin/env python` looks python up on PATH at run time.
+
+    An absolute path to the script says nothing about whether it can start.
+    """
+    assert not engine._survives_a_bare_path(
+        _script(tmp_path / "track", "/usr/bin/env python3")
+    )
+
+
+def test_a_console_script_with_an_absolute_interpreter_survives(tmp_path: Path) -> None:
+    assert engine._survives_a_bare_path(
+        _script(tmp_path / "track", "/some/venv/bin/python")
+    )
+
+
+def test_a_real_binary_needs_nothing(tmp_path: Path) -> None:
+    binary = tmp_path / "track"
+    binary.write_bytes(b"\x7fELF\x02\x01\x01\x00")
+    binary.chmod(0o755)
+    assert engine._survives_a_bare_path(binary)
+
+
+def test_a_relative_shebang_is_refused(tmp_path: Path) -> None:
+    assert not engine._survives_a_bare_path(_script(tmp_path / "track", "python3"))
+
+
+def test_a_missing_file_is_refused(tmp_path: Path) -> None:
+    assert not engine._survives_a_bare_path(tmp_path / "nope")
+
+
+def test_the_venv_console_script_beats_a_wrapper_on_path(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The whole bug, as a test.
+
+    `which` finds the wrapper; the console script beside the running
+    interpreter is the one that actually works, and it wins.
+    """
+    venv = tmp_path / "venv" / "bin"
+    venv.mkdir(parents=True)
+    _script(venv / "track", str(venv / "python"))
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    wrapper = _script(shim_dir / "track", "/bin/sh", "exec ownbox\n")
+
+    monkeypatch.setattr(engine.sys, "executable", str(venv / "python"))
+    monkeypatch.setattr(engine.shutil, "which", lambda _name: str(wrapper))
+
+    assert engine.track_binary() == str(venv / "track")
+
+
+def test_a_wrapper_is_used_but_warned_about_when_it_is_all_there_is(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Scheduling something that may fail loudly beats not scheduling at all."""
+    wrapper = _script(tmp_path / "track", "/bin/sh", "exec ownbox\n")
+    monkeypatch.setattr(engine.sys, "executable", str(tmp_path / "nothing" / "python"))
+    monkeypatch.setattr(engine.shutil, "which", lambda _name: str(wrapper))
+    # argv[0] is the last-resort candidate and under pytest it is pytest,
+    # which is a perfectly good console script -- so it has to be pinned
+    # somewhere absent for the wrapper to be the only thing there is.
+    monkeypatch.setattr(engine.sys, "argv", [str(tmp_path / "nothing" / "track")])
+    warnings: list[str] = []
+
+    assert engine.track_binary(warn=warnings.append) == str(wrapper)
+    assert any("exit 127" in w for w in warnings)
+
+
+def test_the_scheduled_command_never_depends_on_a_bare_name(store) -> None:
+    """The property, asserted directly on what gets written into a task.
+
+    Every element must be an absolute path or a flag -- a fired task inherits
+    no PATH, no cwd and no environment from whoever scheduled it.
+    """
+    for cmd in (
+        engine.run_command(store, "a1"),
+        engine.slot_run_command(store, "08:00"),
+    ):
+        assert Path(cmd[0]).is_absolute()
+        assert engine._survives_a_bare_path(Path(cmd[0]))
+        assert Path(cmd[cmd.index("--db") + 1]).is_absolute()
+
+
+def test_the_running_interpreter_s_sibling_wins_among_equals(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Ordering only decides between candidates that both work.
+
+    Certification is what makes the answer safe; this is what stops a stale
+    second install on PATH being preferred over the track that is running.
+    """
+    venv = tmp_path / "venv" / "bin"
+    venv.mkdir(parents=True)
+    _script(venv / "track", str(venv / "python"))
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    _script(stale / "track", "/usr/bin/python3")
+
+    monkeypatch.setattr(engine.sys, "executable", str(venv / "python"))
+    monkeypatch.setattr(engine.shutil, "which", lambda _name: str(stale / "track"))
+
+    assert engine.track_binary() == str(venv / "track")

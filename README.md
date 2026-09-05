@@ -647,6 +647,17 @@ from deploying it that way, rather than assumptions:
   ten different times are ten wakeups, and if the machine powers off after
   each, ten sleep/wake cycles. Grouping only happens when the times are
   literally equal; track will not round 08:00 and 08:05 together for you.
+- **The scheduled command is resolved once, at schedule time, from the
+  environment of whoever ran the command.** A fired task inherits no PATH, no
+  cwd and no environment, so the absolute path to a `track` is baked into the
+  task when it is armed. track picks the console script beside the running
+  interpreter and refuses any candidate that would still need PATH to start —
+  a `#!/bin/sh` wrapper, or a `#!/usr/bin/env python` shebang. That check
+  exists because it was missing: an install through a wrapper put an absolute
+  path to a two-line `exec ownbox "$@"` shim into a task, which exited 127 at
+  06:02 having done nothing, while `--then poweroff` still took the box down.
+  Re-arming from a shell whose PATH differs is still the way to change which
+  binary a task runs.
 - **`wake` will not power the machine off while a person is connected.** Its
   presence guard counts a logind session of `Class=user`, an attached tmux
   client, and an interactive ssh login (`sshd: user@pts/N`; `@notty` and
