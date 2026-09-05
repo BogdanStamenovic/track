@@ -45,6 +45,24 @@ from .store import Store
 
 DEFAULT_SOURCE_LIMIT = 5
 
+# The longest one research cycle can take before its own timeouts stop it.
+# Derived from those timeouts rather than measured, because a measurement is
+# a sample and this is the ceiling -- and because the number is used to tell
+# an external scheduler when to give up, where guessing low kills a run that
+# was still working. Twelve real runs on this database took 37s to 224s, so
+# the ceiling is roughly 2.5x the worst one actually seen.
+#
+# wake's own default is 300s, which is under a single assignment's ceiling
+# and well under a slot running several. A morning run being killed at the
+# five-minute mark is how you get a report that never arrives and no error
+# that says why.
+WORST_CASE_RUN_SECONDS = (
+    scouts.DEFAULT_TIMEOUT  # source discovery, when it is due
+    + scouts.DEFAULT_TIMEOUT
+    * -(-DEFAULT_SOURCE_LIMIT // scouts.DEFAULT_MAX_WORKERS)  # scout waves
+    + scouts.CHECK_TIMEOUT  # the reaper's re-check batch
+)
+
 
 def run_command(store: Store, assignment_id: str) -> list[str]:
     """How a scheduler should spell "run this assignment".
@@ -143,6 +161,7 @@ def _rearm_wake(
             target=assignment.wake_target,
             run_on=assignment.wake_on,
             wake_available=True,
+            task_timeout=WORST_CASE_RUN_SECONDS,
         )
     except TrackError as exc:
         message = f"could not schedule the next check: {exc}"

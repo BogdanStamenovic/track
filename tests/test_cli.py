@@ -10,8 +10,9 @@ import pytest
 
 from track.cli import SUBCOMMANDS, _build_parser, _split_web_args, main
 from track.engine import RunOutcome
-from track.errors import TrackError
+from track.errors import ScoutError, TrackError
 from track.scheduler import ScheduleResult
+from track.scouts import ScheduleAdvice
 from track.store import Store
 
 
@@ -28,8 +29,29 @@ def no_side_effects(monkeypatch):
         lambda *a, **k: ScheduleResult("job-1", "wake", "2026-01-01T00:00:00+00:00"),
     )
     monkeypatch.setattr("track.cli.cancel_schedule", lambda *a, **k: None)
+    # Slot scheduling does not go through `schedule_wakeup`; it goes through
+    # slots.arm, which probes and calls the real wake. Faking only the first
+    # left `track add --at` shelling out from a unit test.
+    monkeypatch.setattr("track.cli.slots.arm", fake_arm)
     monkeypatch.delenv("TRACK_HOTLINE_AGENT", raising=False)
     monkeypatch.delenv("TRACK_HOTLINE_CHANNEL", raising=False)
+
+
+def fake_arm(store: Store, check_at: str, run_cmd: list[str], **kwargs: object):
+    """What slots.arm does, minus the subprocess.
+
+    It has to write the schedule back onto every member, because that is how
+    a member knows which shared task to cancel when it is the last one out.
+    """
+    members = store.slot_members(check_at)
+    if not members:
+        return None
+    result = ScheduleResult(
+        f"track-slot-{check_at.replace(':', '')}", "wake", "2026-01-01T00:00:00+00:00"
+    )
+    for member in members:
+        store.set_schedule(member.id, result.job_id, result.backend, result.next_run_at)
+    return result
 
 
 def _add(db: Path, *extra: str) -> str:
@@ -674,3 +696,220 @@ def test_everything_after_the_web_verb_is_passed_through_untouched() -> None:
     )
     assert tokens == ["--db", "x.db", "web"]
     assert extra == ["--port", "8080", "--open"]
+
+
+# -- choosing a check time -----------------------------------------------
+
+
+def _advice(monkeypatch, check_at: str = "07:30", why: str = "sellers post overnight") -> list[str]:
+    """Stand in for the Sonnet advisor and record what it was asked about."""
+    asked: list[str] = []
+
+    def fake(text: str, **kwargs: object):
+        asked.append(text)
+        return ScheduleAdvice(check_at=check_at, rationale=why, cost_usd=0.01)
+
+    monkeypatch.setattr("track.cli.scouts.recommend_check_time", fake)
+    return asked
+
+
+def test_interval_and_at_together_are_a_usage_error(capsys, db: Path) -> None:
+    """They are alternatives, not layers, and --help says so."""
+    rc = main(["--db", str(db), "add", "x", "--interval", "6h", "--at", "08:00"])
+    assert rc == 2
+    assert "alternatives" in capsys.readouterr().err
+
+
+def test_an_explicit_time_is_taken_as_given_and_skips_the_advisor(
+    monkeypatch, db: Path
+) -> None:
+    asked = _advice(monkeypatch)
+    assignment_id = _add(db, "--at", "8:00")
+
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+    assert row is not None
+    assert row.check_at == "08:00"
+    assert row.check_at_source == "user"
+    assert asked == []
+
+
+def test_an_explicit_interval_also_skips_the_advisor(monkeypatch, db: Path) -> None:
+    asked = _advice(monkeypatch)
+    assignment_id = _add(db, "--interval", "2h")
+
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+    assert row is not None
+    assert row.check_at is None
+    assert row.interval_seconds == 7200
+    assert asked == []
+
+
+def test_with_neither_the_advisor_picks_the_time_and_its_reason_is_kept(
+    monkeypatch, capsys, db: Path
+) -> None:
+    _advice(monkeypatch, "07:30", "sellers post overnight")
+    import contextlib
+    import io
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert main(["--db", str(db), "add", "a laptop"]) == 0
+    assignment_id = out.getvalue().strip()
+
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+    assert row is not None
+    assert row.check_at == "07:30"
+    assert row.check_at_source == "agent"
+    assert row.check_at_rationale == "sellers post overnight"
+    # The reason is told to the operator at the moment it is chosen, not
+    # only kept for later.
+    assert "sellers post overnight" in capsys.readouterr().err
+
+
+def test_an_advisor_that_fails_costs_quality_not_function(
+    monkeypatch, capsys, db: Path
+) -> None:
+    """The whole degradation rule, in one test.
+
+    No opinion about the best hour must never stop an assignment being
+    tracked -- it falls back to exactly the flat interval that used to be
+    the default, and says that it did.
+    """
+    def boom(text: str, **kwargs: object):
+        raise ScoutError("claude CLI not found on PATH")
+
+    monkeypatch.setattr("track.cli.scouts.recommend_check_time", boom)
+    assignment_id = _add(db)  # _add passes --no-advise
+
+    monkeypatch.setattr("track.cli.scouts.recommend_check_time", boom)
+    import contextlib
+    import io
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert main(["--db", str(db), "add", "a GPU"]) == 0
+    fell_back = out.getvalue().strip()
+
+    with Store(db) as store:
+        row = store.get_assignment(fell_back)
+    assert row is not None
+    assert row.check_at is None
+    assert row.interval_seconds == 6 * 3600
+    err = capsys.readouterr().err
+    assert "could not work out the best time" in err
+    assert assignment_id  # the --no-advise one was unaffected
+
+
+def test_no_advise_does_not_call_the_advisor(monkeypatch, db: Path) -> None:
+    asked = _advice(monkeypatch)
+    _add(db)
+    assert asked == []
+
+
+def test_a_usage_error_is_caught_before_the_advisor_is_paid_for(
+    monkeypatch, db: Path
+) -> None:
+    """Spending a Sonnet call to then reject the command line is pure waste."""
+    asked = _advice(monkeypatch)
+    assert main(["--db", str(db), "add", "x", "--wake-backend", "wol"]) == 2
+    assert asked == []
+
+
+def test_show_prints_why_the_time_was_chosen(monkeypatch, capsys, db: Path) -> None:
+    _advice(monkeypatch, "07:30", "sellers post overnight")
+    import contextlib
+    import io
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        main(["--db", str(db), "add", "a laptop"])
+    assignment_id = out.getvalue().strip()
+    capsys.readouterr()
+
+    assert main(["--db", str(db), "show", assignment_id]) == 0
+    shown = capsys.readouterr().out
+    assert "daily at 07:30" in shown
+    assert "sellers post overnight" in shown
+    assert "advisor" in shown
+
+
+# -- slots, end to end through the CLI ------------------------------------
+
+
+def test_run_takes_exactly_one_selector(capsys, db: Path) -> None:
+    assert main(["--db", str(db), "run"]) == 2
+    assert main(["--db", str(db), "run", "abc", "--all-active"]) == 2
+    assert main(["--db", str(db), "run", "--all-active", "--slot", "08:00"]) == 2
+    assert "exactly one" in capsys.readouterr().err
+
+
+def test_a_slot_run_runs_only_that_slot(monkeypatch, db: Path) -> None:
+    ran: list[str] = []
+
+    def fake_run(store, assignment, **kwargs):
+        ran.append(assignment.id)
+        return RunOutcome([], "summary", True, 1, 0)
+
+    monkeypatch.setattr("track.cli.run_assignment", fake_run)
+    monkeypatch.setattr("track.cli.slots.arm", lambda *a, **k: None)
+    monkeypatch.setattr("track.cli.wake_supports_every", lambda **k: False)
+
+    morning = _add(db, "--at", "08:00")
+    _add(db, "--at", "19:00")
+
+    assert main(["--db", str(db), "run", "--slot", "08:00"]) == 0
+    assert ran == [morning]
+
+
+def test_pausing_a_member_rebuilds_the_slot_without_it(monkeypatch, db: Path) -> None:
+    armed: list[tuple[str, int]] = []
+
+    def recording_arm(store, check_at, run_cmd, **kwargs):
+        armed.append((check_at, len(store.slot_members(check_at))))
+        return fake_arm(store, check_at, run_cmd, **kwargs)
+
+    monkeypatch.setattr("track.cli.slots.arm", recording_arm)
+    _add(db, "--at", "08:00")
+    stays = _add(db, "--at", "08:00")
+    assert armed == [("08:00", 1), ("08:00", 2)]
+
+    assert main(["--db", str(db), "pause", stays]) == 0
+    # Re-armed for the one that is left, not cancelled.
+    assert armed[-1] == ("08:00", 1)
+
+
+def test_removing_the_last_member_cancels_the_shared_task(monkeypatch, db: Path) -> None:
+    cancelled: list[str] = []
+    monkeypatch.setattr(
+        "track.cli.cancel_schedule", lambda job_id, backend, **k: cancelled.append(job_id)
+    )
+
+    only = _add(db, "--at", "08:00")
+    assert main(["--db", str(db), "remove", only]) == 0
+    assert cancelled == ["track-slot-0800"]
+
+
+def test_unscheduling_a_member_detaches_it_but_keeps_the_reasoning(
+    monkeypatch, db: Path
+) -> None:
+    _advice(monkeypatch, "07:30", "sellers post overnight")
+    monkeypatch.setattr("track.cli.slots.arm", lambda *a, **k: None)
+    monkeypatch.setattr("track.cli.cancel_schedule", lambda *a, **k: None)
+    import contextlib
+    import io
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        main(["--db", str(db), "add", "a laptop"])
+    assignment_id = out.getvalue().strip()
+
+    assert main(["--db", str(db), "unschedule", assignment_id]) == 0
+    with Store(db) as store:
+        row = store.get_assignment(assignment_id)
+    assert row is not None
+    assert row.status == "active"
+    assert row.check_at is None
+    assert row.check_at_rationale == "sellers post overnight"

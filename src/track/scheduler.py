@@ -127,6 +127,7 @@ def _invoke_wake_add(
     run_on: str | None = None,
     every: str | None = None,
     then: str | None = None,
+    task_timeout: int | None = None,
 ) -> str:
     # --at is always epoch seconds, never a relative offset: wake rejects a
     # bare "+5" outright and used to read it as 1970, firing immediately.
@@ -135,6 +136,8 @@ def _invoke_wake_add(
         cmd += ["--every", every]
     if then:
         cmd += ["--then", then]
+    if task_timeout:
+        cmd += ["--timeout", str(task_timeout)]
     if target:
         cmd += ["--target", target]
     if task_id:
@@ -282,6 +285,7 @@ def schedule(
     every: str | None = None,
     then: str | None = None,
     at_clock: str | None = None,
+    task_timeout: int | None = None,
 ) -> ScheduleResult:
     """Arm the next wakeup, `interval_seconds` from now or at `at_epoch`.
 
@@ -299,6 +303,10 @@ def schedule(
     `at_clock` is the same wall-clock time as `at_epoch`, spelled "HH:MM",
     and is used only by the systemd fallback, whose OnCalendar= wants the
     literal time rather than an instant.
+
+    `task_timeout` is how long wake gives the command before killing it.
+    wake's own default is 300s, which is less than one research cycle's worst
+    case, so anything scheduling a run has to say what it actually needs.
     """
     if wake_backend not in ("shell", *RESUME_BACKENDS):
         raise SchedulerError(f"unknown wake backend: {wake_backend!r}")
@@ -364,6 +372,7 @@ def schedule(
         run_on=run_on,
         every=every,
         then=then,
+        task_timeout=task_timeout,
     )
     return ScheduleResult(
         job_id=job_id,

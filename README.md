@@ -29,13 +29,14 @@ python -m venv .venv
 ## Usage
 
 ```
-track add "<what to track>" [--interval 6h] [--max-price N] [--notify AGENT]
+track add "<what to track>" [--at HH:MM | --interval 6h] [--then-poweroff]
+                            [--no-advise] [--max-price N] [--notify AGENT]
                             [--wake-backend shell|rtcwake|wol] [--wake-target MAC]
                             [--wake-on HOST] [--no-schedule]
 track list [--json]
 track show <assignment-id> [--limit N] [--json]
 track sources <assignment-id> [--json]
-track run <assignment-id> | --all-active [--no-post] [--force]
+track run <assignment-id> | --all-active | --slot HH:MM [--no-post] [--force]
 track unschedule <assignment-id>
 track pause <assignment-id>
 track resume <assignment-id>
@@ -44,7 +45,10 @@ track remove <assignment-id>
 
 | Option | Meaning |
 | --- | --- |
-| `--interval` | how often to re-check: `6h`, `30m`, `2d`, or bare seconds |
+| `--at` | check daily at this local wall-clock time. Mutually exclusive with `--interval` |
+| `--interval` | how often to re-check, as a period: `6h`, `30m`, `2d`, or bare seconds |
+| `--then-poweroff` | power the machine down after this assignment's time slot has run |
+| `--no-advise` | skip the Sonnet call that picks a check time; use the flat `6h` default |
 | `--max-price` | ceiling; dearer finds are still recorded, just kept out of the summary |
 | `--market` | where you are buying from, e.g. `Serbia` — a hard constraint on which sources count, not a preference (default `$TRACK_MARKET`) |
 | `--notify` | hotline agent whose Discord channel gets the summary — **needed for scheduled runs** (see below) |
@@ -54,6 +58,7 @@ track remove <assignment-id>
 | `unschedule` | drop track's own recurring wakeup but keep the assignment runnable, for when an external scheduler owns the timing |
 | `--no-post` | run without posting to Discord |
 | `--all-active` | run every active assignment in turn, for a scheduler that owns one wakeup for the whole database |
+| `--slot` | run every active assignment whose daily check time is this, in sequence — what one shared wakeup fires |
 | `--force` | run an assignment that is paused |
 | `-v, --verbose` | detailed progress on stderr |
 | `-q, --quiet` | suppress non-error output |
@@ -463,6 +468,58 @@ same file size and same mtime second means Python will reuse the stale
 bytecode and report a result for code you are no longer running. That happened
 here, on source verified byte-identical to git.
 
+## Choosing when to check, and shutting down after
+
+By default `track add` spends one Sonnet call working out what time of day is
+worth checking that particular thing, and stores the reasoning alongside the
+time:
+
+```
+$ track add "a cheap second-hand GPU" --market Serbia --at 08:00 --then-poweroff
+tracking 5d98f49e: 'a cheap second-hand GPU' in Serbia daily at 08:00 (you asked)
+08:00 slot: 2 assignments via wake (job track-slot-0800), next 2026-09-06T06:00:00+00:00, then powers the machine off
+
+$ track show 5d98f49e
+5d98f49e: a cheap second-hand GPU [active]
+  daily at 08:00 via wake · 0 runs · ~$0.00 of model usage
+  why 08:00: private sellers list in the evening and the good ones go within
+  a day, so a morning check sees a full night of new stock. [advisor]
+  08:00 slot: 2 assignment(s), shared with c71e05b4; powers the machine off afterwards
+```
+
+An explicit `--at` or `--interval` is a decision and skips the advisor
+entirely. So does `--no-advise`. If the advisor is unreachable or answers with
+something that is not a time, `track add` says so and falls back to the flat
+`6h` interval that used to be the default — the feature costs quality when it
+is missing, never function.
+
+**The scheduled unit is a time, not an assignment.** Assignments that share a
+wall-clock time share one `wake` task, which runs them one after another
+(`track run --slot 08:00`) and shuts the machine down once, at the end.
+
+This is not tidiness, it is the only shape that works. If each assignment
+owned its own wakeup and its own `--then poweroff`, the first one to finish
+would pull the plug on the others mid-run — and they would not report that
+they had been cut off. Giving each its own minute only narrows the race,
+because a research cycle lasts however long five Sonnet scouts take (37–224s
+measured over twelve runs; the ceiling before the scouts' own timeouts bite is
+540s). A slot makes the sequencing structural instead of a convention living
+in a shell script.
+
+A slot powers off **only when every assignment in it asked to**. One member
+that did not is enough to keep the machine up: the cost of that is an idle
+box, and the cost of the opposite is somebody's run dying under them. `wake`
+adds its own guard on top — it refuses to power off while anyone is logged
+in, attached or ssh'd.
+
+Recurrence prefers wake's native `--every` over re-arming after each run,
+because a recurring row survives both a run that crashed before it could
+re-arm and a box that was switched off when the task was due. Support is
+detected by reading `wake add --help`, not by version: the wake with `--every`
+and the wake without it both report `0.1.0`, so a version check would answer
+confidently and wrongly. Without it, the slot re-arms itself at the end of
+each run, as before.
+
 ## Running it unattended
 
 `track run` is designed to be fired by a scheduler on a machine with nobody
@@ -539,6 +596,32 @@ from deploying it that way, rather than assumptions:
   are what a read-only fetch can honestly distinguish, not ground truth.
 - **The `wake` integration is one file.** `scheduler.py` is the only place
   that knows wake's CLI shape; if that contract changes, nothing else does.
+- **The advisor picks an hour, not a cadence.** It answers one question —
+  what time of day — and every slot is daily. It cannot say "twice a week" or
+  "every three hours", and it is asked once, at `track add`, never again as
+  the category changes. Re-advising an existing assignment means removing it
+  and adding it back.
+- **The advisor's reasoning is a claim, not a measurement.** It is a Sonnet
+  session's opinion about when a category's sellers post, and nothing in
+  track checks it against when findings actually turned up. It is stored and
+  printed so a human can judge it, which is the whole reason it is stored.
+- **A daily slot drifts by an hour for one day across a clock change.** Under
+  wake's `--every`, recurrence is anchored to an absolute instant and adds
+  exact seconds, so "daily at 08:00" keeps firing at the same UTC moment when
+  the clocks move — permanently, since a recurring row is never re-armed.
+  track detects this instead of accepting it: a slot that fires more than 30
+  minutes from its nominal time re-anchors itself to local time and is back on
+  schedule the next day. So the observable cost of a DST change is one run an
+  hour early or late, twice a year, not six months of them. The two ambiguous
+  hours *inside* a transition still resolve to whichever instant Python picks.
+- **Nothing stops two slots from being minutes apart.** Ten assignments at
+  ten different times are ten wakeups, and if the machine powers off after
+  each, ten sleep/wake cycles. Grouping only happens when the times are
+  literally equal; track will not round 08:00 and 08:05 together for you.
+- **A slot's poweroff needs `wake`.** The systemd fallback has no equivalent
+  of `--then poweroff` and refuses the request outright rather than pretending
+  it worked. `wake`'s own poweroff runs `sudo -n systemctl poweroff` and so
+  needs a passwordless sudo rule for that command.
 - **Self-re-arming needs `wake` 7041d08 or newer.** Because `track run`
   re-arms the same task id while wake is still holding it open, an older wake
   stamped `status=fired` over the re-arm after the command returned — leaving

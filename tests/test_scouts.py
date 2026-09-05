@@ -23,6 +23,7 @@ from track.scouts import (
     ScoutFinding,
     check_listings,
     discover_sources,
+    recommend_check_time,
     run_scouts,
     scout_listings,
 )
@@ -441,3 +442,85 @@ def test_output_with_no_array_at_all_is_still_an_error() -> None:
 
 def test_an_honestly_empty_result_is_not_an_error() -> None:
     assert scout_listings("a laptop", "KP", runner=_runner(envelope("[]"))).findings == []
+
+
+# -- the schedule advisor -------------------------------------------------
+#
+# It shares the containment apparatus above, so what is worth testing here is
+# the other half: that a bad answer is refused rather than acted on, since
+# acting on one sets when the machine wakes up.
+
+ADVICE = '{"check_at": "07:30", "why": "Sellers list overnight; 07:30 catches the batch."}'
+
+
+def test_the_advisor_returns_a_time_and_a_reason() -> None:
+    seen, runner = _capturing(envelope(ADVICE, cost=0.02))
+
+    advice = recommend_check_time("a laptop", market="Serbia", runner=runner)
+
+    assert advice.check_at == "07:30"
+    assert "overnight" in advice.rationale
+    assert advice.cost_usd == 0.02
+    assert "MARKET: Serbia" in seen["prompt"]
+
+
+def test_the_advisor_is_contained_exactly_like_a_scout() -> None:
+    """Same flags, because the same global CLAUDE.md reaches it."""
+    seen, runner = _capturing(envelope(ADVICE))
+    recommend_check_time("a laptop", runner=runner)
+
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("--tools") + 1] == SCOUT_TOOLS
+    assert cmd[cmd.index("--allowedTools") + 1] == SCOUT_ALLOWED_TOOLS
+    assert "--strict-mcp-config" in cmd
+    assert cmd[cmd.index("--setting-sources") + 1] == ""
+
+
+def test_a_single_digit_hour_is_normalised() -> None:
+    _seen, runner = _capturing(envelope('{"check_at": "7:05", "why": "because"}'))
+    assert recommend_check_time("a laptop", runner=runner).check_at == "07:05"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        '{"check_at": "25:00", "why": "because"}',
+        '{"check_at": "morning", "why": "because"}',
+        '{"check_at": null, "why": "because"}',
+        '{"why": "because"}',
+    ],
+)
+def test_an_answer_with_no_usable_time_is_refused(answer: str) -> None:
+    _seen, runner = _capturing(envelope(answer))
+    with pytest.raises(ScoutError, match="no usable time"):
+        recommend_check_time("a laptop", runner=runner)
+
+
+def test_a_time_with_no_reasoning_is_refused() -> None:
+    """A cadence nobody can audit is worse than no cadence at all.
+
+    The rationale is the whole reason the advisor beats a flat default, so
+    an answer without one falls back to the flat default instead.
+    """
+    _seen, runner = _capturing(envelope('{"check_at": "08:00", "why": null}'))
+    with pytest.raises(ScoutError, match="no reason"):
+        recommend_check_time("a laptop", runner=runner)
+
+
+def test_prose_around_the_object_does_not_sink_the_answer() -> None:
+    _seen, runner = _capturing(
+        envelope('Here you go:\n```json\n' + ADVICE + '\n```\nHope that helps.')
+    )
+    assert recommend_check_time("a laptop", runner=runner).check_at == "07:30"
+
+
+def test_an_empty_object_never_beats_a_real_one() -> None:
+    """The array parser learned this the hard way; the object parser inherits it."""
+    _seen, runner = _capturing(envelope("{} " + ADVICE))
+    assert recommend_check_time("a laptop", runner=runner).check_at == "07:30"
+
+
+def test_an_answer_with_no_object_at_all_is_refused() -> None:
+    _seen, runner = _capturing(envelope("I would check it in the morning."))
+    with pytest.raises(ScoutError, match="no JSON object"):
+        recommend_check_time("a laptop", runner=runner)

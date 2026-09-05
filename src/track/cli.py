@@ -42,7 +42,13 @@ from pathlib import Path
 from typing import NoReturn
 
 from . import __version__, scouts, slots
-from .engine import RunOutcome, run_assignment, run_command, slot_run_command
+from .engine import (
+    WORST_CASE_RUN_SECONDS,
+    RunOutcome,
+    run_assignment,
+    run_command,
+    slot_run_command,
+)
 from .errors import TrackError
 from .models import Assignment, Finding, ListingStatus
 from .scheduler import cancel as cancel_schedule
@@ -125,15 +131,17 @@ def _build_parser() -> argparse.ArgumentParser:
     add_p.add_argument(
         "--interval",
         default=None,
-        help="how often to re-check (e.g. 6h, 30m). Given explicitly it wins over the "
-        f"advisor; given neither this nor --at, the advisor picks a daily time and "
-        f"{DEFAULT_INTERVAL} is the fallback if it cannot",
+        help="how often to re-check, as a period (e.g. 6h, 30m). Mutually exclusive "
+        f"with --at. Either one, given explicitly, skips the advisor; given neither, "
+        f"the advisor picks a daily time and {DEFAULT_INTERVAL} is the fallback if "
+        "it cannot",
     )
     add_p.add_argument(
         "--at",
         dest="check_at",
-        help="check daily at this local wall-clock time, e.g. 08:00. Assignments "
-        "sharing a time share one wakeup and run in sequence",
+        help="check daily at this local wall-clock time, e.g. 08:00. Mutually "
+        "exclusive with --interval. Assignments sharing a time share one wakeup "
+        "and run in sequence",
     )
     add_p.add_argument(
         "--then-poweroff",
@@ -323,6 +331,7 @@ def _arm(store: Store, assignment: Assignment, log: Callable[[str], None]) -> No
             wake_backend=assignment.wake_backend or "shell",
             target=assignment.wake_target,
             run_on=assignment.wake_on,
+            task_timeout=WORST_CASE_RUN_SECONDS,
         )
     except TrackError as exc:
         log(f"track: warning: could not schedule wakeups: {exc}")
@@ -540,13 +549,18 @@ def _run_slot(store: Store, args: argparse.Namespace, log: Callable[[str], None]
     and if the slot is going to power the machine off it must do so after the
     last assignment rather than after whichever finished first.
 
-    The slot is re-armed here only when wake cannot recur on its own. On a
+    The slot is re-armed here only when wake cannot recur on its own -- on a
     wake with `--every`, the row is already scheduled for tomorrow and
-    re-arming it mid-fire would rewrite the task that is currently running.
+    re-arming it mid-fire would rewrite the task that is currently running --
+    or when the slot has drifted off its wall-clock time, which is how a
+    recurring row survives a daylight-saving change (see slots.drifted).
     """
     check_at = slots.parse_check_at(args.slot)
     code = _run_sequence(store, store.slot_members(check_at), args, log)
     if not scheduler_recurs(store, check_at):
+        _arm_slot(store, check_at, log)
+    elif slots.drifted(check_at):
+        log(f"track: the {check_at} slot fired well off its time; re-anchoring to local time")
         _arm_slot(store, check_at, log)
     return code
 

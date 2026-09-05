@@ -35,6 +35,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 
 from . import scheduler
+from .engine import WORST_CASE_RUN_SECONDS
 from .errors import SchedulerError
 from .models import Assignment
 from .scheduler import RESUME_BACKENDS, ScheduleResult
@@ -91,6 +92,37 @@ def next_occurrence(check_at: str, *, now: float | None = None) -> int:
     if candidate.timestamp() <= stamp + scheduler.MIN_LEAD_SECONDS:
         candidate += timedelta(days=1)
     return int(candidate.timestamp())
+
+
+# How far a slot may fire from its nominal time before track concludes the
+# schedule itself has moved, rather than the run merely being late. A DST
+# transition shifts it by a full hour; a late fire on a box that was off, or
+# a slow wake poll, is minutes. Thirty minutes separates the two cleanly.
+DRIFT_TOLERANCE_SECONDS = 1800
+
+
+def drifted(check_at: str, *, now: float | None = None) -> bool:
+    """Whether a slot is firing at a materially different wall-clock time.
+
+    This is the DST correction, and it is why it is worth having rather than
+    just documenting. wake's `--every` anchors on an absolute instant and
+    adds exact seconds, so a row meaning "daily at 08:00" keeps firing at the
+    same UTC moment when the clocks change and drifts to 07:00 or 09:00
+    local -- permanently, because a recurring row is never re-armed.
+
+    So the slot checks, when it runs, whether it actually ran at the hour it
+    was supposed to. If not, it re-anchors itself to local time and is back
+    on schedule the next day. One run an hour off, twice a year, instead of
+    six months of them.
+    """
+    hour, minute = (int(part) for part in check_at.split(":"))
+    stamp = now if now is not None else time.time()
+    fired = datetime.fromtimestamp(stamp)  # noqa: DTZ006 -- local wall clock is the question
+    nominal = fired.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    # Compared across midnight both ways, so a 00:30 slot firing at 23:30 the
+    # night before reads as half an hour out rather than 23 hours out.
+    delta = abs((fired - nominal).total_seconds())
+    return min(delta, 86400 - delta) > DRIFT_TOLERANCE_SECONDS
 
 
 def _resume_config(
@@ -176,6 +208,12 @@ def arm(
         at_clock=check_at,
         every=DAILY if supports_every else None,
         then="poweroff" if poweroff else None,
+        # The slot runs its members one after another, so it needs the sum of
+        # their ceilings, not one of them. wake kills the command at this
+        # point; too low and the last assignment in the slot is cut off
+        # mid-run, which on a slot that powers off afterwards means it never
+        # runs at all that day.
+        task_timeout=len(members) * WORST_CASE_RUN_SECONDS,
     )
     for member in members:
         store.set_schedule(
