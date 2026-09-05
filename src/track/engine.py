@@ -60,8 +60,17 @@ def run_command(store: Store, assignment_id: str) -> list[str]:
     every run; the two spellings drifting apart means the first scheduled run
     works and every one after it does not.
     """
+    return _track_cmd(store) + ["run", assignment_id]
+
+
+def slot_run_command(store: Store, check_at: str) -> list[str]:
+    """How a scheduler should spell "run everything due at HH:MM"."""
+    return _track_cmd(store) + ["run", "--slot", check_at]
+
+
+def _track_cmd(store: Store) -> list[str]:
     track_bin = shutil.which("track") or str(Path(sys.argv[0]).resolve())
-    return [track_bin, "--db", str(Path(store.db_path).resolve()), "run", assignment_id]
+    return [track_bin, "--db", str(Path(store.db_path).resolve())]
 
 # Re-run source discovery every N runs even when sources are already known.
 # Without this the source list is frozen at whatever the very first scout
@@ -118,6 +127,12 @@ def _rearm_wake(
     assignment on its second run with no signal but a line on a dead stream.
     """
     if assignment.backend != "wake" or assignment.status != "active":
+        return None
+    if assignment.check_at:
+        # A slot assignment does not own its wakeup: the slot does, and it is
+        # re-armed once after the last assignment in it has run. Re-arming
+        # here would point the shared task at this assignment alone, which is
+        # the failure the slot exists to prevent.
         return None
     try:
         result = scheduler.schedule(

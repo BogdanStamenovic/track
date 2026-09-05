@@ -24,6 +24,19 @@ class Assignment:
     wake_on: str | None = None  # which machine runs the task (wake's --on)
     resume_job_id: str | None = None  # the paired rtcwake/wol task, if any
     runs_count: int = 0
+    # Daily wall-clock check time, "HH:MM" local, or None for plain interval
+    # recurrence. The two are alternatives, not layers: an assignment with a
+    # `check_at` is scheduled as part of a shared slot (see slots.py) and its
+    # `interval_seconds` is then only a fallback for a scheduler that cannot
+    # express a wall-clock time.
+    check_at: str | None = None
+    # Why that time, in the advisor's own words, and who chose it: "agent"
+    # when a Sonnet advisor picked it, "user" when a human passed --at. Kept
+    # because a cadence with no reasoning attached is a number nobody can
+    # audit, and because a user's choice must never be silently re-advised.
+    check_at_rationale: str | None = None
+    check_at_source: str | None = None  # "agent" | "user"
+    poweroff_after: bool = False  # power the machine down once the slot's runs finish
 
 
 @dataclass(frozen=True, slots=True)

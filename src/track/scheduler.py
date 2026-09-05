@@ -67,12 +67,37 @@ def _default_runner(cmd: list[str], *, timeout: int) -> subprocess.CompletedProc
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
 
 
+def wake_supports_every(*, runner: Runner = _default_runner, timeout: int = 10) -> bool:
+    """Whether the wake on PATH understands `--every` (native recurrence).
+
+    Probed from `wake add --help` rather than from `wake --version`, because
+    the version string does not move: the build with `--every` and the build
+    without it both report 0.1.0, so anything keyed on the version would
+    answer confidently and wrongly. The help text is the contract the CLI
+    actually publishes.
+
+    A probe that cannot run answers False, which is the safe direction: track
+    then re-arms after every run, which works on both builds.
+    """
+    try:
+        result = runner([WAKE_BIN, "add", "--help"], timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    return "--every" in (result.stdout or "") + (result.stderr or "")
+
+
 @dataclass(frozen=True, slots=True)
 class ScheduleResult:
     job_id: str
     backend: str  # "wake" | "systemd-timer"
     next_run_at: str  # ISO8601, best-effort
     resume_job_id: str | None = None
+    # True when the scheduler will fire this again on its own. The caller
+    # uses it to decide whether a finished run still has to arm its own
+    # successor -- doing that on top of a recurring row is how you get two
+    # timers for one job.
+    recurring: bool = False
+    then: str | None = None  # what the machine does after the task, e.g. "poweroff"
 
 
 def _floor_at(base: float, interval_seconds: int) -> int:
@@ -100,10 +125,16 @@ def _invoke_wake_add(
     runner: Runner,
     timeout: int,
     run_on: str | None = None,
+    every: str | None = None,
+    then: str | None = None,
 ) -> str:
     # --at is always epoch seconds, never a relative offset: wake rejects a
     # bare "+5" outright and used to read it as 1970, firing immediately.
     cmd = [WAKE_BIN, "add", "--at", str(run_at_epoch), "--task", task, "--backend", backend]
+    if every:
+        cmd += ["--every", every]
+    if then:
+        cmd += ["--then", then]
     if target:
         cmd += ["--target", target]
     if task_id:
@@ -144,7 +175,9 @@ def _systemd_unit_paths(label: str) -> tuple[Path, Path]:
     return unit_dir / f"track-{label}.service", unit_dir / f"track-{label}.timer"
 
 
-def _schedule_systemd_timer(label: str, interval_seconds: int, run_cmd: list[str]) -> str:
+def _schedule_systemd_timer(
+    label: str, interval_seconds: int, run_cmd: list[str], *, at: str | None = None
+) -> str:
     service_path, timer_path = _systemd_unit_paths(label)
     service_path.parent.mkdir(parents=True, exist_ok=True)
     service_path.write_text(
@@ -161,12 +194,21 @@ def _schedule_systemd_timer(label: str, interval_seconds: int, run_cmd: list[str
     # accepts it and even writes a stamp file, but its catch-up behaviour only
     # applies to OnCalendar= timers, so on a monotonic one it is a line that
     # reads like a guarantee and provides nothing.
+    # A wall-clock slot gets OnCalendar, which is the one timer kind whose
+    # catch-up Persistent= actually governs -- so a box that was off at 08:00
+    # runs the slot when it comes back instead of waiting for tomorrow.
+    # OnCalendar also tracks local time across a DST change on its own, which
+    # a fixed-period timer cannot.
+    schedule_lines = (
+        f"OnCalendar=*-*-* {at}:00\nPersistent=true\n"
+        if at
+        else f"OnUnitActiveSec={interval_seconds}s\nOnActiveSec=0s\n"
+    )
     timer_path.write_text(
         "[Unit]\n"
         f"Description=track timer for {label}\n\n"
         "[Timer]\n"
-        f"OnUnitActiveSec={interval_seconds}s\n"
-        "OnActiveSec=0s\n\n"
+        f"{schedule_lines}\n"
         "[Install]\n"
         "WantedBy=timers.target\n"
     )
@@ -235,8 +277,29 @@ def schedule(
     timeout: int = 30,
     wake_available: bool | None = None,
     now: float | None = None,
+    label: str | None = None,
+    at_epoch: int | None = None,
+    every: str | None = None,
+    then: str | None = None,
+    at_clock: str | None = None,
 ) -> ScheduleResult:
-    """Arm the next wakeup for an assignment, `interval_seconds` from now."""
+    """Arm the next wakeup, `interval_seconds` from now or at `at_epoch`.
+
+    `label` names the pair of wake tasks. It defaults to the assignment id,
+    which is what a per-assignment interval schedule wants; a daily slot
+    passes its own label so that several assignments share one wakeup and one
+    shutdown instead of racing (see slots.py).
+
+    `every` asks wake for native recurrence and is only ever passed when
+    `wake_supports_every()` said yes -- an older wake rejects the flag
+    outright, and a scheduling call that fails is an assignment that stops
+    running. `then` is handed to wake's `--then`, which is what actually
+    powers the machine down after the task finishes.
+
+    `at_clock` is the same wall-clock time as `at_epoch`, spelled "HH:MM",
+    and is used only by the systemd fallback, whose OnCalendar= wants the
+    literal time rather than an instant.
+    """
     if wake_backend not in ("shell", *RESUME_BACKENDS):
         raise SchedulerError(f"unknown wake backend: {wake_backend!r}")
     if wake_backend == "wol" and not target:
@@ -245,6 +308,7 @@ def schedule(
     if wake_available is None:
         wake_available = shutil.which(WAKE_BIN) is not None
     base = now if now is not None else time.time()
+    label = label or assignment_id
 
     if not wake_available:
         if wake_backend in RESUME_BACKENDS:
@@ -252,16 +316,22 @@ def schedule(
                 f"the {wake_backend} backend needs the `wake` CLI on PATH "
                 "(a systemd timer cannot wake a sleeping machine)"
             )
+        if then:
+            raise SchedulerError(
+                "powering the machine down after a run needs the `wake` CLI on PATH "
+                "(a systemd --user timer has no equivalent of `wake --then poweroff`)"
+            )
         job_id = _schedule_systemd_timer(
-            assignment_id, max(interval_seconds, MIN_LEAD_SECONDS), run_cmd
+            label, max(interval_seconds, MIN_LEAD_SECONDS), run_cmd, at=at_clock
         )
         return ScheduleResult(
             job_id=job_id,
             backend="systemd-timer",
-            next_run_at=_isoformat(_floor_at(base, interval_seconds)),
+            next_run_at=_isoformat(at_epoch or _floor_at(base, interval_seconds)),
+            recurring=True,
         )
 
-    resume_at = _floor_at(base, interval_seconds)
+    resume_at = at_epoch if at_epoch is not None else _floor_at(base, interval_seconds)
     resume_job_id: str | None = None
     if wake_backend in RESUME_BACKENDS:
         resume_job_id = _invoke_wake_add(
@@ -269,9 +339,15 @@ def schedule(
             wake_backend,
             backend=wake_backend,
             target=target,
-            task_id=resume_task_id_for(assignment_id),
+            task_id=resume_task_id_for(label),
             runner=runner,
             timeout=timeout,
+            # wake refuses --every on the rtcwake backend at add time, so a
+            # recurring rtcwake pair would fail on the resume half and leave
+            # a run task with nothing to wake the machine for it. The run
+            # task still recurs; the resume task is re-armed after each run
+            # like it always was.
+            every=None if wake_backend == "rtcwake" else every,
         )
         run_at = resume_at + RESUME_GRACE_SECONDS
     else:
@@ -282,16 +358,23 @@ def schedule(
         " ".join(run_cmd),
         backend="shell",
         target=None,
-        task_id=task_id_for(assignment_id),
+        task_id=task_id_for(label),
         runner=runner,
         timeout=timeout,
         run_on=run_on,
+        every=every,
+        then=then,
     )
     return ScheduleResult(
         job_id=job_id,
         backend="wake",
         next_run_at=_isoformat(run_at),
         resume_job_id=resume_job_id,
+        # An rtcwake pair is only half recurring (see above), so the caller
+        # still has to re-arm it. Claiming otherwise here is how the resume
+        # task silently stops happening.
+        recurring=bool(every) and wake_backend != "rtcwake",
+        then=then,
     )
 
 

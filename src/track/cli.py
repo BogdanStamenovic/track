@@ -37,20 +37,27 @@ import os
 import re
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import NoReturn
 
-from . import __version__
-from .engine import RunOutcome, run_assignment, run_command
+from . import __version__, scouts, slots
+from .engine import RunOutcome, run_assignment, run_command, slot_run_command
 from .errors import TrackError
 from .models import Assignment, Finding, ListingStatus
 from .scheduler import cancel as cancel_schedule
 from .scheduler import schedule as schedule_wakeup
+from .scheduler import wake_supports_every
 from .scoring import source_stats
 from .store import Store
 
 _INTERVAL_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+# What an assignment falls back to when nobody -- not the user, not the
+# advisor -- has said when to check it. Deliberately the same 6h that used to
+# be the flag's default, so a track that cannot reach the advisor behaves
+# exactly like the track that shipped before the advisor existed.
+DEFAULT_INTERVAL = "6h"
 
 
 class _UsageError(Exception):
@@ -116,7 +123,29 @@ def _build_parser() -> argparse.ArgumentParser:
     add_p = sub.add_parser("add", help="track a new assignment")
     add_p.add_argument("text", help="what to track, e.g. 'a powerful but cheap laptop'")
     add_p.add_argument(
-        "--interval", default="6h", help="how often to re-check (e.g. 6h, 30m); default 6h"
+        "--interval",
+        default=None,
+        help="how often to re-check (e.g. 6h, 30m). Given explicitly it wins over the "
+        f"advisor; given neither this nor --at, the advisor picks a daily time and "
+        f"{DEFAULT_INTERVAL} is the fallback if it cannot",
+    )
+    add_p.add_argument(
+        "--at",
+        dest="check_at",
+        help="check daily at this local wall-clock time, e.g. 08:00. Assignments "
+        "sharing a time share one wakeup and run in sequence",
+    )
+    add_p.add_argument(
+        "--then-poweroff",
+        action="store_true",
+        help="power the machine down once every assignment in this time slot has run "
+        "(wake's --then poweroff); ignored unless every assignment in the slot asks for it",
+    )
+    add_p.add_argument(
+        "--no-advise",
+        action="store_true",
+        help="do not spend a Sonnet call working out the best time to check; "
+        f"use the {DEFAULT_INTERVAL} default instead",
     )
     add_p.add_argument("--max-price", type=float, default=None, help="price ceiling for reports")
     add_p.add_argument(
@@ -165,6 +194,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="which assignment to run; omit it and pass --all-active instead",
     )
     run_p.add_argument(
+        "--slot",
+        dest="slot",
+        help="run every active assignment whose daily check time is this, in sequence "
+        "-- what one shared wakeup fires",
+    )
+    run_p.add_argument(
         "--all-active",
         action="store_true",
         help="run every active assignment in turn -- what a scheduler with one "
@@ -201,7 +236,85 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@dataclass(frozen=True, slots=True)
+class _Cadence:
+    """When a new assignment should be checked, and on whose authority."""
+
+    interval_seconds: int
+    check_at: str | None = None
+    rationale: str | None = None
+    source: str | None = None  # "agent" | "user"
+
+
+# What `interval_seconds` is set to for a daily assignment. It is not what
+# schedules it -- the slot's wall-clock time is -- but the column is NOT NULL
+# and something has to run the assignment if it is ever moved off a slot.
+A_DAY = 86400
+
+
+def _resolve_cadence(args: argparse.Namespace, log: Callable[[str], None]) -> _Cadence:
+    """Decide a new assignment's cadence: the user's word, then the advisor's.
+
+    Order matters and is the whole point. An explicit `--at` or `--interval`
+    is a decision, not a hint, so the advisor is never consulted and never
+    gets to overrule it. Only when the user has said nothing is a Sonnet call
+    worth its second or two, and even then a failure is a warning rather than
+    an error -- an assignment nobody can advise on is still an assignment
+    worth tracking on the old flat interval.
+    """
+    if args.check_at:
+        return _Cadence(A_DAY, check_at=slots.parse_check_at(args.check_at), source="user")
+    if args.interval:
+        return _Cadence(_parse_interval(args.interval))
+    if args.no_advise or args.no_schedule:
+        return _Cadence(_parse_interval(DEFAULT_INTERVAL))
+    log("track: asking a Sonnet advisor what time of day is worth checking this...")
+    try:
+        advice = scouts.recommend_check_time(args.text, market=args.market)
+    except TrackError as exc:
+        log(
+            f"track: warning: could not work out the best time to check ({exc}); "
+            f"falling back to every {DEFAULT_INTERVAL}"
+        )
+        return _Cadence(_parse_interval(DEFAULT_INTERVAL))
+    return _Cadence(
+        A_DAY, check_at=advice.check_at, rationale=advice.rationale, source="agent"
+    )
+
+
+def _cadence_phrase(cadence: _Cadence) -> str:
+    if cadence.check_at:
+        who = "you asked" if cadence.source == "user" else "the advisor picked it"
+        return f"daily at {cadence.check_at} ({who})"
+    return f"every {cadence.interval_seconds}s"
+
+
+def _arm_slot(store: Store, check_at: str, log: Callable[[str], None]) -> None:
+    """(Re)arm the shared wakeup for one daily slot and report what it will do."""
+    try:
+        result = slots.arm(
+            store, check_at, slot_run_command(store, check_at), warn=log
+        )
+    except TrackError as exc:
+        log(f"track: warning: could not schedule the {check_at} slot: {exc}")
+        return
+    if result is None:
+        log(f"the {check_at} slot has no active assignments left; its wakeup is cancelled")
+        return
+    members = store.slot_members(check_at)
+    plural = "" if len(members) == 1 else "s"
+    tail = ", then powers the machine off" if result.then == "poweroff" else ""
+    recurs = "daily" if result.recurring else "once (re-armed after each run)"
+    log(
+        f"{check_at} slot: {len(members)} assignment{plural} via {result.backend} "
+        f"(job {result.job_id}), {recurs}, next {result.next_run_at}{tail}"
+    )
+
+
 def _arm(store: Store, assignment: Assignment, log: Callable[[str], None]) -> None:
+    if assignment.check_at:
+        _arm_slot(store, assignment.check_at, log)
+        return
     try:
         result = schedule_wakeup(
             assignment.id,
@@ -221,6 +334,19 @@ def _arm(store: Store, assignment: Assignment, log: Callable[[str], None]) -> No
 
 
 def _disarm(store: Store, assignment: Assignment, log: Callable[[str], None]) -> None:
+    """Detach one assignment from whatever was going to run it.
+
+    A slot member's wake task is shared, so cancelling it outright would take
+    the other members down with it. The membership query is what decides:
+    this must be called *after* the row has been paused or deleted, so the
+    slot is re-armed for exactly the assignments that are left, and the task
+    is only cancelled once none are.
+    """
+    if assignment.check_at:
+        store.clear_schedule(assignment.id)
+        if store.slot_members(assignment.check_at):
+            _arm_slot(store, assignment.check_at, log)
+            return
     if assignment.job_id and assignment.backend:
         try:
             cancel_schedule(
@@ -327,9 +453,27 @@ def _run_all_active(store: Store, args: argparse.Namespace, log: Callable[[str],
     if not active:
         log("track: no active assignments")
         return 1
+    return _run_sequence(store, active, args, log)
+
+
+def _run_sequence(
+    store: Store,
+    assignments: list[Assignment],
+    args: argparse.Namespace,
+    log: Callable[[str], None],
+) -> int:
+    """Run a list of assignments in order and collapse them into one code.
+
+    Shared by --all-active and --slot because the collapsing rule is the same
+    one either way, and a slot that scored its runs differently from the
+    whole-database sweep would mean two answers to "did this morning work".
+    """
+    if not assignments:
+        log("track: nothing to run")
+        return 1
     worst = 1
     any_usable = False
-    for assignment in active:
+    for assignment in assignments:
         log(f"track: running {assignment.id} ({assignment.text[:60]})")
         try:
             outcome = run_assignment(store, assignment, warn=log, post=not args.no_post)
@@ -346,6 +490,75 @@ def _run_all_active(store: Store, args: argparse.Namespace, log: Callable[[str],
     if worst == 3:
         return 3
     return 0 if any_usable else 1
+
+
+def _cadence_line(assignment: Assignment) -> str:
+    if assignment.check_at:
+        return f"daily at {assignment.check_at}"
+    return f"every {assignment.interval_seconds}s"
+
+
+def _schedule_notes(store: Store, assignment: Assignment) -> list[str]:
+    """The why behind the schedule, for `track show`.
+
+    A check time with no reasoning attached is a number nobody can audit, so
+    the advisor's own words are printed rather than just the hour it chose --
+    and who chose it, because "the model picked 07:00" and "you asked for
+    07:00" are different claims about how much to trust it.
+    """
+    notes: list[str] = []
+    if assignment.check_at_rationale:
+        who = {"agent": "advisor", "user": "you"}.get(
+            assignment.check_at_source or "", "unknown"
+        )
+        when = assignment.check_at or "(no longer scheduled to a time)"
+        notes.append(f"why {when}: {assignment.check_at_rationale} [{who}]")
+    elif assignment.check_at and assignment.check_at_source == "user":
+        notes.append(f"why {assignment.check_at}: you asked for it")
+    if assignment.check_at:
+        members = store.slot_members(assignment.check_at)
+        others = [m.id for m in members if m.id != assignment.id]
+        shared = f", shared with {', '.join(others)}" if others else ""
+        if assignment.poweroff_after:
+            tail = (
+                "powers the machine off afterwards"
+                if all(m.poweroff_after for m in members)
+                else "asked to power off, but another assignment in this slot did not, "
+                "so the machine stays up"
+            )
+        else:
+            tail = "leaves the machine up"
+        notes.append(f"{assignment.check_at} slot: {len(members)} assignment(s){shared}; {tail}")
+    return notes
+
+
+def _run_slot(store: Store, args: argparse.Namespace, log: Callable[[str], None]) -> int:
+    """Run one daily slot: every assignment due at this time, in sequence.
+
+    This is what a slot's single wake task fires, and the sequence is the
+    point -- each cycle already fans five Sonnet scouts out on a 6-core box,
+    and if the slot is going to power the machine off it must do so after the
+    last assignment rather than after whichever finished first.
+
+    The slot is re-armed here only when wake cannot recur on its own. On a
+    wake with `--every`, the row is already scheduled for tomorrow and
+    re-arming it mid-fire would rewrite the task that is currently running.
+    """
+    check_at = slots.parse_check_at(args.slot)
+    code = _run_sequence(store, store.slot_members(check_at), args, log)
+    if not scheduler_recurs(store, check_at):
+        _arm_slot(store, check_at, log)
+    return code
+
+
+def scheduler_recurs(store: Store, check_at: str) -> bool:
+    """Whether the slot's task will fire again without track re-arming it."""
+    if not wake_supports_every():
+        return False
+    members = store.slot_members(check_at)
+    # An rtcwake slot's resume half cannot recur (wake refuses --every on it),
+    # so the pair has to be re-armed even though the run task would recur.
+    return not any((m.wake_backend or "shell") == "rtcwake" for m in members)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -366,23 +579,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.verbose and not args.quiet:
             print(message, file=sys.stderr)
 
-    if args.command == "run" and bool(args.assignment_id) == bool(args.all_active):
-        print("track: error: run takes either an assignment id or --all-active", file=sys.stderr)
-        return 2
+    if args.command == "run":
+        selectors = [bool(args.assignment_id), bool(args.all_active), bool(args.slot)]
+        if sum(selectors) != 1:
+            print(
+                "track: error: run takes exactly one of an assignment id, --all-active "
+                "or --slot HH:MM",
+                file=sys.stderr,
+            )
+            return 2
 
     interval_seconds = 0
+    cadence = _Cadence(0)
     if args.command == "add":
-        try:
-            interval_seconds = _parse_interval(args.interval)
-        except _UsageError as exc:
-            print(f"track: error: {exc}", file=sys.stderr)
+        if args.interval and args.check_at:
+            print(
+                "track: error: --interval and --at are alternatives "
+                "(--at is a daily wall-clock time, --interval a period)",
+                file=sys.stderr,
+            )
             return 2
+        # Every cheap usage check runs before the advisor does. Resolving the
+        # cadence can spend a Sonnet call, and spending one to then reject the
+        # command line for a missing MAC address is pure waste.
         if args.wake_backend == "wol" and not args.wake_target:
             print(
                 "track: error: --wake-backend wol needs --wake-target <MAC address>",
                 file=sys.stderr,
             )
             return 2
+        try:
+            cadence = _resolve_cadence(args, log)
+        except TrackError as exc:
+            print(f"track: error: {exc}", file=sys.stderr)
+            return 2
+        except _UsageError as exc:
+            print(f"track: error: {exc}", file=sys.stderr)
+            return 2
+        interval_seconds = cadence.interval_seconds
         if not args.notify and not args.no_schedule:
             log(
                 "track: warning: no --notify agent; scheduled runs have no Claude session, "
@@ -402,14 +636,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     wake_backend=args.wake_backend,
                     wake_target=args.wake_target,
                     wake_on=args.wake_on,
+                    check_at=cadence.check_at,
+                    check_at_rationale=cadence.rationale,
+                    check_at_source=cadence.source,
+                    poweroff_after=args.then_poweroff,
                 )
                 where = f" in {assignment.market}" if assignment.market else ""
-                cadence = (
+                when = (
                     "on demand only (not scheduled)"
                     if args.no_schedule
-                    else f"every {args.interval}"
+                    else _cadence_phrase(cadence)
                 )
-                log(f"tracking {assignment.id}: {assignment.text!r}{where} {cadence}")
+                log(f"tracking {assignment.id}: {assignment.text!r}{where} {when}")
+                if cadence.rationale:
+                    log(f"  why {cadence.check_at}: {cadence.rationale}")
                 if not assignment.market:
                     log(
                         "track: warning: no --market set, so scouts will return whatever "
@@ -457,11 +697,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     return 0
                 print(f"{assignment.id}: {assignment.text} [{assignment.status}]")
                 print(
-                    f"  every {assignment.interval_seconds}s via "
+                    f"  {_cadence_line(assignment)} via "
                     f"{assignment.backend or 'no schedule'}"
                     f" · {assignment.runs_count} runs"
                     f" · ~${store.total_cost(assignment.id):.2f} of model usage"
                 )
+                for line in _schedule_notes(store, assignment):
+                    print(f"  {line}")
                 print(f"sources ({len(sources)}):")
                 for s in sources:
                     print(f"  - {s.name} (seen {s.times_seen}x) {s.url or ''}".rstrip())
@@ -513,6 +755,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return _serve_web(store, web_args, log)
 
             if args.command == "run":
+                if args.slot:
+                    return _run_slot(store, args, log)
                 if args.all_active:
                     return _run_all_active(store, args, log)
                 assignment = _require(store, args.assignment_id)
@@ -527,23 +771,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(outcome.summary)
                 return _run_exit_code(outcome, posting=not args.no_post, log=log)
 
+            # The row is changed *before* _disarm in all three, not after.
+            # A slot's wake task is shared, and _disarm re-arms it for
+            # whoever is still in the slot -- so the assignment being taken
+            # out has to have stopped being a member by then, or the slot is
+            # rebuilt around it and nothing actually changes.
             if args.command == "unschedule":
                 assignment = _require(store, args.assignment_id)
+                if assignment.check_at:
+                    # Leaving the slot is what "an external scheduler owns
+                    # the timing" means for a daily assignment. The advisor's
+                    # reasoning is kept, so `track show` can still say what
+                    # time was suggested and why.
+                    store.set_check_at(
+                        assignment.id,
+                        None,
+                        rationale=assignment.check_at_rationale,
+                        source=assignment.check_at_source,
+                    )
                 _disarm(store, assignment, log)
                 log(f"unscheduled {assignment.id}; it stays active but will not self-run")
                 return 0
 
             if args.command == "remove":
                 assignment = _require(store, args.assignment_id)
-                _disarm(store, assignment, log)
                 store.remove_assignment(assignment.id)
+                _disarm(store, assignment, log)
                 log(f"removed {assignment.id}")
                 return 0
 
             if args.command == "pause":
                 assignment = _require(store, args.assignment_id)
-                _disarm(store, assignment, log)
                 store.set_status(assignment.id, "paused")
+                _disarm(store, assignment, log)
                 log(f"paused {assignment.id}")
                 return 0
 

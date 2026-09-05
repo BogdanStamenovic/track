@@ -6,12 +6,19 @@ that do the web research and hand back strict JSON. This module owns the
 subprocess boundary so the rest of track can be exercised in tests without
 touching the network or the real `claude` binary.
 
+Three questions get asked this way, all of them about one assignment: who
+sells this cheap, what is on offer right now, and -- once, when the
+assignment is created -- what time of day is worth checking it. The last one
+shares this module because it shares the whole containment apparatus below,
+not because scheduling is market research.
+
 Containment is the point of this module, so it is spelled out here.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -326,6 +333,113 @@ def check_listings(
             ListingCheck(url=url, state=state, price=price, note=_text(item.get("note"), limit=200))
         )
     return checks, cost
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleAdvice:
+    """When to check an assignment, and the advisor's reason for saying so."""
+
+    check_at: str  # "HH:MM", 24-hour, the operator's local time
+    rationale: str
+    cost_usd: float = 0.0
+
+
+# One tool call, not three: this is a judgement about a category's rhythm,
+# not a price hunt, and the difference between a well-reasoned 07:00 and a
+# well-reasoned 08:00 is not worth a web search. Short timeout for the same
+# reason -- an advisor that stalls must not hold up `track add`.
+ADVICE_TIMEOUT = 60
+
+SCHEDULE_ADVICE_TEMPLATE = """You are advising on when, in the day, to check for new
+listings matching this assignment: {assignment}
+{market_clause}
+Pick ONE daily wall-clock time, 24-hour, in the BUYER's local time.
+
+Reason about this category's actual rhythm, not a generic answer:
+- when do sellers in this category post -- evenings, weekday mornings,
+  weekends? A check shortly AFTER the posting peak sees the most new stock.
+- how fast does a good listing get taken? Something that sells within the
+  hour is worth catching early in the day; something that sits for a week is
+  not, and an unsociable hour buys nothing.
+- when could the buyer actually act on what you found? A find at 03:00 that
+  is gone by 09:00 was never really a find.
+
+Prefer a time between 06:00 and 23:00 unless the category genuinely rewards
+an unsociable one, and say so if you pick one.
+
+{block_policy}
+
+Budget: at most 1 tool call, and none is fine -- you are being asked for
+judgement, not research. Respond with ONLY a JSON object, no prose, no
+markdown fences:
+
+{{"check_at": "<HH:MM>", "why": "<two sentences at most: the rhythm you are
+fitting, and what checking at that hour buys over checking at another>"}}"""
+
+
+def _parse_json_object(raw: str) -> dict[str, Any]:
+    """The richest JSON object in a scout's answer.
+
+    Same discipline as `_parse_json_array` and for the same reason: an answer
+    with a stray `{` in its prose, or an empty object before the real one,
+    must not cost the whole call. Richest wins, so `{}` never beats a real
+    answer.
+    """
+    text = raw.strip()
+    decoder = json.JSONDecoder()
+    best: dict[str, Any] | None = None
+    for start in (i for i, ch in enumerate(text) if ch == "{"):
+        try:
+            value, _end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and (best is None or len(value) > len(best)):
+            best = value
+    if best is None:
+        raise ScoutError(f"advisor output had no JSON object: {text[:200]!r}")
+    return best
+
+
+_CLOCK_RE = re.compile(r"^(\d{1,2}):([0-5]\d)$")
+
+
+def recommend_check_time(
+    assignment_text: str,
+    *,
+    market: str | None = None,
+    model: str = DEFAULT_MODEL,
+    timeout: int = ADVICE_TIMEOUT,
+    runner: Runner = _default_runner,
+    max_budget_usd: str = SCOUT_MAX_BUDGET_USD,
+) -> ScheduleAdvice:
+    """Ask one Sonnet session what time of day to check this assignment.
+
+    Raises ScoutError on anything the caller should not act on -- no claude
+    binary, a timeout, an answer with no clock time in it. The caller is
+    expected to fall back to a plain interval rather than propagate it: a
+    missing opinion about the best hour must never stop an assignment being
+    tracked at all.
+    """
+    prompt = SCHEDULE_ADVICE_TEMPLATE.format(
+        assignment=assignment_text,
+        block_policy=BLOCK_POLICY,
+        market_clause=_market_clause(market),
+    )
+    raw, cost = _run_claude(
+        prompt, model=model, timeout=timeout, runner=runner, max_budget_usd=max_budget_usd
+    )
+    answer = _parse_json_object(raw)
+    match = _CLOCK_RE.match(_text(answer.get("check_at"), limit=5) or "")
+    if not match or int(match.group(1)) > 23:
+        raise ScoutError(f"advisor gave no usable time: {str(answer.get('check_at'))[:60]!r}")
+    rationale = _text(answer.get("why"), limit=500)
+    if not rationale:
+        raise ScoutError("advisor gave a time with no reason for it")
+    return ScheduleAdvice(
+        check_at=f"{int(match.group(1)):02d}:{match.group(2)}",
+        rationale=rationale,
+        cost_usd=cost,
+    )
 
 
 def _build_cmd(model: str, max_budget_usd: str) -> list[str]:

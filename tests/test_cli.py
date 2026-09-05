@@ -38,7 +38,9 @@ def _add(db: Path, *extra: str) -> str:
 
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        assert main(["--db", str(db), "add", "a laptop", *extra]) == 0
+        # --no-advise by default: these tests are about everything except
+        # the advisor, and it is the one code path that would shell out.
+        assert main(["--db", str(db), "add", "a laptop", "--no-advise", *extra]) == 0
     return out.getvalue().strip()
 
 
@@ -74,7 +76,7 @@ def test_unknown_assignment_is_a_failure_not_a_usage_error(capsys, db: Path) -> 
 
 
 def test_add_prints_only_the_id_on_stdout(capsys, db: Path) -> None:
-    assert main(["--db", str(db), "add", "a laptop"]) == 0
+    assert main(["--db", str(db), "add", "a laptop", "--no-advise"]) == 0
     captured = capsys.readouterr()
 
     assert len(captured.out.strip()) == 8
@@ -125,7 +127,7 @@ def test_interval_units(db: Path, text: str, seconds: int) -> None:
 
 def test_scheduling_a_run_with_no_notify_target_warns(capsys, db: Path) -> None:
     """That run would find things and have nowhere to report them."""
-    main(["--db", str(db), "add", "a laptop"])
+    main(["--db", str(db), "add", "a laptop", "--no-advise"])
     assert "no --notify agent" in capsys.readouterr().err
 
 
@@ -139,7 +141,7 @@ def test_a_scheduler_failure_does_not_lose_the_assignment(capsys, db: Path, monk
     from track.errors import SchedulerError
 
     monkeypatch.setattr("track.cli.schedule_wakeup", _raiser(SchedulerError("wake add failed")))
-    rc = main(["--db", str(db), "add", "a laptop", "--notify", "x"])
+    rc = main(["--db", str(db), "add", "a laptop", "--no-advise", "--notify", "x"])
     captured = capsys.readouterr()
 
     assert rc == 0
@@ -377,7 +379,7 @@ def test_adding_without_a_market_warns_that_results_will_be_foreign(
     capsys, db: Path, monkeypatch
 ) -> None:
     monkeypatch.delenv("TRACK_MARKET", raising=False)
-    main(["--db", str(db), "add", "a laptop", "--notify", "x"])
+    main(["--db", str(db), "add", "a laptop", "--no-advise", "--notify", "x"])
 
     assert "no --market set" in capsys.readouterr().err
 

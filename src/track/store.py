@@ -144,6 +144,10 @@ _ADDED_COLUMNS = [
     ("assignments", "wake_on", "TEXT"),
     ("assignments", "resume_job_id", "TEXT"),
     ("assignments", "runs_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("assignments", "check_at", "TEXT"),
+    ("assignments", "check_at_rationale", "TEXT"),
+    ("assignments", "check_at_source", "TEXT"),
+    ("assignments", "poweroff_after", "INTEGER NOT NULL DEFAULT 0"),
     ("runs", "cost_usd", "REAL NOT NULL DEFAULT 0"),
     ("findings", "reference_price", "REAL"),
     ("findings", "reference_n", "INTEGER"),
@@ -381,12 +385,17 @@ class Store:
         wake_backend: str | None = None,
         wake_target: str | None = None,
         wake_on: str | None = None,
+        check_at: str | None = None,
+        check_at_rationale: str | None = None,
+        check_at_source: str | None = None,
+        poweroff_after: bool = False,
     ) -> Assignment:
         assignment_id = uuid.uuid4().hex[:8]
         self._conn.execute(
             "INSERT INTO assignments (id, text, interval_seconds, status, max_price, "
-            "created_at, market, notify_agent, wake_backend, wake_target, wake_on) "
-            "VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
+            "created_at, market, notify_agent, wake_backend, wake_target, wake_on, "
+            "check_at, check_at_rationale, check_at_source, poweroff_after) "
+            "VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 assignment_id,
                 text,
@@ -398,6 +407,10 @@ class Store:
                 wake_backend,
                 wake_target,
                 wake_on,
+                check_at,
+                check_at_rationale,
+                check_at_source,
+                int(poweroff_after),
             ),
         )
         self._conn.commit()
@@ -415,6 +428,42 @@ class Store:
     def list_assignments(self) -> list[Assignment]:
         rows = self._conn.execute("SELECT * FROM assignments ORDER BY created_at").fetchall()
         return [_row_to_assignment(row) for row in rows]
+
+    def slot_members(self, check_at: str) -> list[Assignment]:
+        """Active assignments that share one daily check time.
+
+        Ordered by creation, so a slot's runs happen in a stable order rather
+        than whatever sqlite feels like -- an unattended sequence that
+        reorders itself between mornings is one nobody can reason about.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM assignments WHERE check_at = ? AND status = 'active' "
+            "ORDER BY created_at",
+            (check_at,),
+        ).fetchall()
+        return [_row_to_assignment(row) for row in rows]
+
+    def active_slots(self) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT DISTINCT check_at FROM assignments "
+            "WHERE check_at IS NOT NULL AND status = 'active' ORDER BY check_at"
+        ).fetchall()
+        return [row["check_at"] for row in rows]
+
+    def set_check_at(
+        self,
+        assignment_id: str,
+        check_at: str | None,
+        *,
+        rationale: str | None = None,
+        source: str | None = None,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE assignments SET check_at = ?, check_at_rationale = ?, "
+            "check_at_source = ? WHERE id = ?",
+            (check_at, rationale, source, assignment_id),
+        )
+        self._conn.commit()
 
     def set_schedule(
         self,
@@ -847,6 +896,10 @@ def _row_to_assignment(row: sqlite3.Row) -> Assignment:
         wake_on=row["wake_on"],
         resume_job_id=row["resume_job_id"],
         runs_count=row["runs_count"],
+        check_at=row["check_at"],
+        check_at_rationale=row["check_at_rationale"],
+        check_at_source=row["check_at_source"],
+        poweroff_after=bool(row["poweroff_after"]),
     )
 
 
